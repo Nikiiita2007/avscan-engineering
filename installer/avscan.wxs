@@ -1,0 +1,57 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- WiX v5 MSI installer. Build: installer/build-msi.sh (needs the MinGW/MSVC exes in build/win first). -->
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
+  <Package Name="AVScan Engineering"
+           Version="0.4.0"
+           Manufacturer="AVScan Engineering"
+           UpgradeCode="faf118fb-4e99-499a-9136-7bcc2ce73792"
+           Scope="perMachine"
+           InstallerVersion="500"
+           Language="1033">
+    <SummaryInformation Description="AVScan antivirus engineering prototype: scanner, monitor service, quarantine, GUI" />
+    <MajorUpgrade DowngradeErrorMessage="A newer version of AVScan is already installed." />
+    <MediaTemplate EmbedCab="yes" />
+    <Launch Condition="Installed OR VersionNT64" Message="AVScan requires a 64-bit Windows." />
+    <Feature Id="Main" Title="AVScan" Level="1" AllowAbsent="no">
+      <ComponentGroupRef Id="ProductComponents" />
+    </Feature>
+    <Property Id="DISABLEADVTSHORTCUTS" Value="1" />
+    <Property Id="WIXUI_INSTALLDIR" Value="INSTALLFOLDER" />
+  </Package>
+
+  <Fragment>
+    <StandardDirectory Id="ProgramFiles64Folder">
+      <Directory Id="INSTALLFOLDER" Name="AVScan">
+        <Directory Id="DbDir" Name="db" />
+      </Directory>
+    </StandardDirectory>
+  </Fragment>
+
+  <Fragment>
+    <ComponentGroup Id="ProductComponents">
+      <Component Directory="INSTALLFOLDER" Id="cmp_avscan_exe">
+        <File Id="file_avscan_exe" Source="$(var.BuildDir)/avscan.exe" KeyPath="yes" />
+      </Component>
+      <Component Directory="INSTALLFOLDER" Id="cmp_avmonitor_exe">
+        <File Id="file_avmonitor_exe" Source="$(var.BuildDir)/avmonitor.exe" KeyPath="yes" />
+        <ServiceInstall Name="AVScanMonitor"
+                        DisplayName="AVScan Monitor"
+                        Description="AVScan directory monitor (IOCP/ETW real-time scanning)"
+                        Type="ownProcess"
+                        Start="auto"
+                        ErrorControl="normal"
+                        Arguments="--service" />
+        <ServiceControl Name="AVScanMonitor" Start="install" Stop="both" Remove="uninstall" Wait="yes" />
+      </Component>
+      <Component Directory="INSTALLFOLDER" Id="cmp_avquarantine_exe">
+        <File Id="file_avquarantine_exe" Source="$(var.BuildDir)/avquarantine.exe" KeyPath="yes" />
+      </Component>
+      <Component Directory="INSTALLFOLDER" Id="cmp_avgui_exe">
+        <File Id="file_avgui_exe" Source="$(var.BuildDir)/avgui.exe" KeyPath="yes" />
+      </Component>
+      <Component Directory="DbDir" Id="cmp_signatures_db">
+        <File Id="file_signatures_db" Source="$(var.SourceDir)/db/signatures.db" KeyPath="yes" />
+      </Component>
+    </ComponentGroup>
+  </Fragment>
+</Wix>

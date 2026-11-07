@@ -1,0 +1,17 @@
+PASS SHA256 empty
+PASS SHA256 abc, concept feed
+PASS expected engine success
+PASS expected engine failure
+PASS clean text
+PASS JPEG not malware
+PASS MZ not malware
+PASS EICAR 68 bytes
+PASS e_lfanew overflow regression
+PASS synthetic PE parse
+PASS missing file Error not Clean
+PASS ZIP clean
+PASS ZIP EICAR
+PASS ZIP limit not Clean
+PASS evidence copy result
+PASS evidence size
+PASS source preserved

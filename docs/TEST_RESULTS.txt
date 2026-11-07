@@ -1,0 +1,20 @@
+Test environment: Linux, GCC 15.2.0. No CMake, clang++, clang-tidy, Windows SDK, vcpkg or libarchive development package available.
+Commands: GCC manual build, -std=c++20 -O1 -g -Wall -Wextra, zlib enabled.
+Offline local Result fallback used; real tl::expected NOT tested here.
+
+avscan --selftest: 11/11 passed.
+quality: 17/17 passed (SHA256 vectors, Result success/failure, clean text, JPEG/MZ,
+EICAR, e_lfanew regression, synthetic PE, Error on missing file,
+ZIP clean/EICAR/size limit, non-destructive evidence copy).
+quality with -fsanitize=address,undefined -fno-sanitize-recover=undefined: 17/17 passed; no sanitizer diagnostics.
+PE mutation smoke under ASan+UBSan: 10000 deterministic cases, no sanitizer diagnostics.
+Archive mutation smoke under ASan+UBSan: 10000 deterministic cases, no sanitizer diagnostics.
+Linux avmonitor / avgui platform stubs: compiled.
+
+NOT VERIFIED:
+- Windows compilation/runtime: IOCP, ETW, native GUI, HANDLE RAII.
+- CMake configuration, vcpkg resolution, real tl::expected branch.
+- clang-tidy run.
+- Coverage-guided libFuzzer execution (targets supplied; mutation smoke is NOT libFuzzer).
+- 7z/RAR runtime and libarchive build.
+No claim of complete vulnerability coverage, correctness certification, or production readiness.

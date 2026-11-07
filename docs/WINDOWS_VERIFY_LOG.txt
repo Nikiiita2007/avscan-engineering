@@ -1,0 +1,33 @@
+Лог верификации AVScan Engineering 0.3 — 2026-11-07 (среда: Ubuntu, GCC 15.2 / Clang 21.1 / MinGW-w64 GCC 13 / CMake 4.2 / Wine 10.0)
+
+1. Linux Release (GCC 15, системные zlib+libarchive, AV_OFFLINE=ON):
+   сборка без ошибок; ctest 2/2 passed (core_selftest, quality);
+   avscan --selftest — все проверки [OK].
+
+2. ASan+UBSan (Clang 21, Debug): сборка чистая, ctest 2/2 passed, отчётов санитайзеров нет.
+   Кросс-проверка: собственный SHA-256 совпадает с sha256sum для тестового файла.
+
+3. libFuzzer (Clang 21, ASan+UBSan, corpus без EICAR):
+   fuzz_pe: 266064 прогона за 90 с, new_units 187, крэшей/ASan-отчётов нет.
+   fuzz_archive: 23550 прогонов за 60 с, new_units 205, крэшей/ASan-отчётов нет.
+
+4. Windows x64 кросс-сборка MinGW-w64 GCC 13 (preset windows-mingw):
+   статическая линковка (-static), zlib 1.3.1 + libarchive 3.7.7 вшиты, внешних DLL нет.
+   avscan.exe / avmonitor.exe / avquarantine.exe / avgui.exe собраны без ошибок.
+   Единственное предупреждение GCC (array subscript overflow в Sha256::hexdigest) —
+   ложное срабатывание: проверка хэша против sha256sum подтверждает корректность.
+
+5. Проверка под Wine 10.0 (все EXE — Windows-бинарники):
+   - avscan.exe --selftest: все тесты [OK].
+   - quality_tests.exe: все проверки PASS.
+   - avscan.exe eicar.com: Infected, exit 0.
+   - avscan.exe eicar.zip: Infected, вложенный sample.txt распакован и детектирован
+     (libarchive работает внутри EXE).
+   - avmonitor.exe --watch: обнаружил скопированный в каталог eicar.com в реальном
+     времени (IOCP/ReadDirectoryChangesW путь работоспособен), JSON-отчёт корректен.
+   - avquarantine.exe: evidence-запись создана (sample.bin + source.txt), исходник сохранён.
+   - avgui.exe: процесс стабильно работает под виртуальным дисплеем, ошибок нет
+     (интерактивная проверка окон на реальной Windows остаётся за пользователем).
+
+Ограничения: Wine — не Windows; ETW не проверялся (требует повышенных прав и реальной ОС).
+Проверки GUI интерактивно и ETW выполните по разделу 10 MANUAL.md.

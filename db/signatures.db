@@ -1,0 +1,20 @@
+# avscan — база сигнатур (учебный пример)
+# Формат: sig|Имя|malware|suspicious|тип|шаблон [&& шаблон ...]
+#   тип: any pe elf script zip 7z rar jpeg
+#   шаблон: HEX с ?? (любой байт), либо "ascii", с необязательным префиксом @смещение:  (абсолютное от начала файла)
+#   && — все условия должны совпасть.
+version|2026.11.07-1
+
+# EICAR: две части в двух условиях (в самой базе целой строки EICAR нет, чтобы не триггерить другие антивирусы)
+sig|EICAR-Test-File|malware|any|"X5O!P%@AP[4\PZX54(P^)7CC)7}$" && "EICAR-STANDARD-ANTIVIRUS-TEST-FILE!"
+
+# Подозрительные признаки в скриптах (дают баллы, но не вердикт сами по себе)
+sig|Script.PowerShell.EncodedCommand|suspicious|script|"powershell" && "-enc"
+sig|Script.PowerShell.DownloadExec|suspicious|script|"DownloadString" && "Invoke-Expression"
+
+# Пример с маской и привязкой к PE (ЗАМЕНИТЕ на реальные сигнатуры; без реальных данных не срабатывает)
+# sig|Example.Family.A|malware|pe|60 E8 ?? ?? ?? ?? 5D 81 ED ?? ?? ?? ?? && "SecretMarker"
+
+# Примеры хэшей и нечётких хэшей (формат):
+# sha256|<64 hex>|Имя.Образца
+# fuzzy|<blocksize:sig1:sig2>|Имя.Семейства

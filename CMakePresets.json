@@ -1,0 +1,47 @@
+{
+  "version": 5,
+  "configurePresets": [
+    {
+      "name": "windows-vcpkg",
+      "generator": "Visual Studio 17 2022",
+      "architecture": "x64",
+      "binaryDir": "${sourceDir}/build/windows",
+      "cacheVariables": {
+        "CMAKE_TOOLCHAIN_FILE": "$env{VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake"
+      }
+    },
+    {
+      "name": "linux-sanitize",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/sanitize",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "CMAKE_TOOLCHAIN_FILE": "$env{VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake",
+        "AV_ASAN": "ON",
+        "AV_UBSAN": "ON"
+      }
+    },
+    {
+      "name": "windows-mingw",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/win",
+      "cacheVariables": {
+        "CMAKE_TOOLCHAIN_FILE": "${sourceDir}/scripts/mingw-toolchain.cmake",
+        "AV_OFFLINE": "ON",
+        "AV_ARCHIVES": "ON",
+        "CMAKE_BUILD_TYPE": "Release",
+        "CMAKE_EXE_LINKER_FLAGS": "-static -static-libgcc -static-libstdc++"
+      }
+    },
+    {
+      "name": "offline",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/offline",
+      "cacheVariables": {
+        "AV_OFFLINE": "ON",
+        "AV_ARCHIVES": "OFF",
+        "CMAKE_BUILD_TYPE": "Debug"
+      }
+    }
+  ]
+}
