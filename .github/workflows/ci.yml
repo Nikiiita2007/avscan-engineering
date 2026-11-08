@@ -46,15 +46,18 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y ninja-build mingw-w64 wine64
       - name: Build zlib for MinGW
         run: |
-          curl -sL -o zlib.tar.gz https://github.com/madler/zlib/releases/download/v1.3.1/zlib-1.3.1.tar.gz
+          set -e
+          curl -fsSL -o zlib.tar.gz https://github.com/madler/zlib/releases/download/v1.3.1/zlib-1.3.1.tar.gz
           tar xzf zlib.tar.gz && cd zlib-1.3.1
           cmake -S . -B b -G Ninja -DCMAKE_TOOLCHAIN_FILE=$GITHUB_WORKSPACE/scripts/mingw-toolchain.cmake \
             -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF
           cmake --build b && sudo cmake --install b --prefix /usr/x86_64-w64-mingw32
           sudo mv /usr/x86_64-w64-mingw32/lib/libzlibstatic.a /usr/x86_64-w64-mingw32/lib/libz.a 2>/dev/null || true
+          test -f /usr/x86_64-w64-mingw32/lib/libz.a
       - name: Build libarchive for MinGW
         run: |
-          curl -sL -o la.tar.xz https://github.com/libarchive/libarchive/releases/download/v3.7.7/libarchive-3.7.7.tar.xz
+          set -e
+          curl -fsSL -o la.tar.xz https://github.com/libarchive/libarchive/releases/download/v3.7.7/libarchive-3.7.7.tar.xz
           tar xf la.tar.xz && cd libarchive-3.7.7
           cmake -S . -B b -G Ninja -DCMAKE_POLICY_VERSION_MINIMUM=3.5 \
             -DCMAKE_TOOLCHAIN_FILE=$GITHUB_WORKSPACE/scripts/mingw-toolchain.cmake -DCMAKE_BUILD_TYPE=Release \
@@ -66,6 +69,7 @@ jobs:
           sudo cp b/libarchive/libarchive.a /usr/x86_64-w64-mingw32/lib/
           sudo cp b/include/archive.h b/include/archive_entry.h /usr/x86_64-w64-mingw32/include/ 2>/dev/null \
             || sudo cp libarchive/archive.h libarchive/archive_entry.h /usr/x86_64-w64-mingw32/include/
+          test -f /usr/x86_64-w64-mingw32/lib/libarchive.a
       - name: Cross-build AVScan
         run: |
           cmake --preset windows-mingw
@@ -75,9 +79,10 @@ jobs:
         run: |
           cd build/win
           wine avscan.exe --selftest
-          wine quality_tests.exe "$GITHUB_WORKSPACE/db/signatures.db" "$GITHUB_WORKSPACE/tests/corpus"
-          wine avscan.exe --no-cache "Z:\\home\\runner\\work\\avscan\\avscan\\tests\\corpus\\eicar.com" || true
-          wine avscan.exe --no-cache "Z:\\home\\runner\\work\\avscan\\avscan\\tests\\corpus\\eicar.zip" || true
+          ZW="Z:${GITHUB_WORKSPACE//\//\\}"
+          wine quality_tests.exe "$ZW\\db\\signatures.db" "$ZW\\tests\\corpus"
+          wine avscan.exe --no-cache "$ZW\\tests\\corpus\\eicar.com" || true
+          wine avscan.exe --no-cache "$ZW\\tests\\corpus\\eicar.zip" || true
           wine avquarantine.exe list db
       - name: Package dist
         run: |
