@@ -37,6 +37,22 @@ jobs:
           ./build/fuzz/fuzz_pe /tmp/corpus -max_len=65536 -max_total_time=60 -timeout=5 -rss_limit_mb=1024 -print_final_stats=1
           ./build/fuzz/fuzz_archive /tmp/corpus -max_len=65536 -max_total_time=60 -timeout=5 -rss_limit_mb=1024 -print_final_stats=1
 
+  tidy:
+    name: clang-tidy (report only)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install tools
+        run: sudo apt-get update && sudo apt-get install -y ninja-build clang clang-tidy zlib1g-dev libarchive-dev
+      - name: Build with clang-tidy
+        run: |
+          cmake -S . -B build/tidy -G Ninja -DCMAKE_CXX_COMPILER=clang++ -DAV_OFFLINE=ON -DAV_TIDY=ON -DCMAKE_BUILD_TYPE=Debug
+          cmake --build build/tidy 2>&1 | tee tidy.log
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with: { name: clang-tidy-report, path: tidy.log, if-no-files-found: ignore }
+
   windows:
     name: Windows x64 (MinGW cross-build + Wine smoke + MSI)
     runs-on: ubuntu-latest
@@ -88,7 +104,7 @@ jobs:
           cp build/win/{avscan,avmonitor,avquarantine,avgui}.exe dist/AVScan-Windows/
           cp db/signatures.db dist/AVScan-Windows/db/
           cp installer/README-dist.txt dist/AVScan-Windows/README.txt 2>/dev/null || true
-          cd dist && zip -r ../avscan-windows-x64.zip AVScan-Windows && cd ..
+          cd dist && zip -r avscan-windows-x64.zip AVScan-Windows && cd ..
       - uses: actions/upload-artifact@v4
         with: { name: avscan-windows-x64, path: dist/ }
 
@@ -127,6 +143,25 @@ jobs:
       - name: Tests
         shell: pwsh
         run: ctest --test-dir build/windows -C Release --output-on-failure
+      - name: Package dist (native MSVC build)
+        shell: pwsh
+        run: |
+          $rel = "build/windows/Release"
+          $dst = "dist/AVScan-Windows-MSVC"
+          New-Item -ItemType Directory -Force "$dst/db" | Out-Null
+          foreach ($e in 'avscan','avmonitor','avquarantine','avgui') { Copy-Item "$rel/$e.exe" $dst }
+          Copy-Item "$rel/*.dll" $dst -ErrorAction SilentlyContinue
+          Copy-Item db/signatures.db "$dst/db/"
+          if (Test-Path installer/README-dist.txt) { Copy-Item installer/README-dist.txt "$dst/README.txt" }
+          Push-Location $dst
+          .\avscan.exe --selftest
+          if ($LASTEXITCODE -ne 0) { throw "selftest of the packaged build failed" }
+          Pop-Location
+          Compress-Archive -Path $dst -DestinationPath dist/avscan-windows-x64-msvc.zip
+      - uses: actions/upload-artifact@v4
+        with:
+          name: avscan-windows-x64-msvc
+          path: dist/avscan-windows-x64-msvc.zip
       - name: Upload build output
         if: always()
         uses: actions/upload-artifact@v4
@@ -160,15 +195,25 @@ jobs:
   release:
     name: Release (on tag)
     runs-on: ubuntu-latest
-    needs: [linux, windows, msi]
+    needs: [linux, windows, windows-msvc, msi]
     if: startsWith(github.ref, 'refs/tags/v')
     permissions: { contents: write }
     steps:
       - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
-        with: { name: avscan-windows-x64, path: dist }
+        with: { name: avscan-windows-x64, path: dist-mingw }
+      - uses: actions/download-artifact@v4
+        with: { name: avscan-windows-x64-msvc, path: dist-msvc }
       - uses: actions/download-artifact@v4
         with: { name: avscan-msi, path: msi }
+      - name: Prepare release assets
+        run: |
+          set -e
+          mkdir -p assets
+          cp dist-msvc/avscan-windows-x64-msvc.zip assets/
+          cp dist-mingw/avscan-windows-x64.zip assets/avscan-windows-x64-mingw.zip
+          cp msi/*.msi assets/
+          cd assets && sha256sum * > SHA256SUMS.txt && cat SHA256SUMS.txt
       - name: Create release
         env:
           GH_TOKEN: ${{ github.token }}
@@ -176,4 +221,4 @@ jobs:
           gh release create "${GITHUB_REF#refs/tags/}" \
             --title "AVScan ${GITHUB_REF#refs/tags/v}" \
             --generate-notes \
-            dist/avscan-windows-x64.zip msi/*.msi
+            assets/*
