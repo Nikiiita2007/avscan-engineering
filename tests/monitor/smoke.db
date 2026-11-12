@@ -1,0 +1,4 @@
+# Signature database ONLY for the avmonitor smoke test (scripts/ci-monitor-smoke.ps1).
+# Not EICAR and not a real signature: the marker below is just a text string.
+version|smoke-1
+sig|AVScan.Smoke.Marker|malware|any|"AVSCAN-MONITOR-SMOKE-MARKER-1"

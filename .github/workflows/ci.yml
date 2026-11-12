@@ -143,6 +143,14 @@ jobs:
       - name: Tests
         shell: pwsh
         run: ctest --test-dir build/windows -C Release --output-on-failure
+      - name: Monitor smoke test (informational for now)
+        shell: pwsh
+        continue-on-error: true
+        run: ./scripts/ci-monitor-smoke.ps1 -Dir build/windows/Release
+      - name: Upload monitor smoke logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with: { name: monitor-smoke-logs, path: smoke-logs/, if-no-files-found: ignore }
       - name: Package dist (native MSVC build)
         shell: pwsh
         run: |
