@@ -81,8 +81,6 @@ jobs:
           wine avscan.exe --selftest
           ZW="Z:${GITHUB_WORKSPACE//\//\\}"
           wine quality_tests.exe "$ZW\\db\\signatures.db" "$ZW\\tests\\corpus"
-          wine avscan.exe --no-cache "$ZW\\tests\\corpus\\eicar.com" || true
-          wine avscan.exe --no-cache "$ZW\\tests\\corpus\\eicar.zip" || true
           wine avquarantine.exe list db
       - name: Package dist
         run: |
@@ -97,11 +95,27 @@ jobs:
   windows-msvc:
     name: Windows x64 (MSVC native + vcpkg)
     runs-on: windows-latest
+    env:
+      VCPKG_DEFAULT_BINARY_CACHE: ${{ github.workspace }}/.vcpkg-cache
     steps:
       - uses: actions/checkout@v4
-      - name: vcpkg version
+      - name: Prepare vcpkg at the pinned baseline
         shell: pwsh
-        run: git -C $env:VCPKG_INSTALLATION_ROOT rev-parse HEAD
+        run: |
+          $root = $env:VCPKG_INSTALLATION_ROOT
+          $bl = (Get-Content vcpkg.json -Raw | ConvertFrom-Json).'builtin-baseline'
+          Write-Host "Runner vcpkg HEAD: $(git -C $root rev-parse HEAD)"
+          Write-Host "Pinned baseline:   $bl"
+          git -C $root fetch origin $bl
+          git -C $root checkout --detach $bl
+          & "$root\bootstrap-vcpkg.bat" -disableMetrics
+          New-Item -ItemType Directory -Force -Path $env:VCPKG_DEFAULT_BINARY_CACHE | Out-Null
+      - name: Cache vcpkg binaries
+        uses: actions/cache@v4
+        with:
+          path: .vcpkg-cache
+          key: vcpkg-${{ runner.os }}-${{ hashFiles('vcpkg.json') }}
+          restore-keys: vcpkg-${{ runner.os }}-
       - name: Configure (preset windows-vcpkg)
         shell: pwsh
         run: |
@@ -110,9 +124,8 @@ jobs:
       - name: Build
         shell: pwsh
         run: cmake --build build/windows --config Release
-      - name: Tests (EICAR may be blocked by Defender)
+      - name: Tests
         shell: pwsh
-        continue-on-error: true
         run: ctest --test-dir build/windows -C Release --output-on-failure
       - name: Upload build output
         if: always()
