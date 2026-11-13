@@ -83,9 +83,13 @@ add_executable(avgui apps/gui_main.cpp)
 target_link_libraries(avgui PRIVATE gui)
 add_executable(quality_tests tests/quality.cpp)
 target_link_libraries(quality_tests PRIVATE core quarantine)
+add_executable(config_events_tests tests/config_events_test.cpp)
+target_include_directories(config_events_tests PRIVATE libs/monitor)
+target_link_libraries(config_events_tests PRIVATE core)
 enable_testing()
 add_test(NAME core_selftest COMMAND avscan --selftest)
 add_test(NAME quality COMMAND quality_tests ${CMAKE_SOURCE_DIR}/db/signatures.db ${CMAKE_SOURCE_DIR}/tests/corpus)
+add_test(NAME config_events COMMAND config_events_tests)
 foreach(t avscan avmonitor avgui)
  add_custom_command(TARGET ${t} POST_BUILD
   COMMAND ${CMAKE_COMMAND} -E make_directory $<TARGET_FILE_DIR:${t}>/db
