@@ -17,7 +17,7 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y ninja-build g++ clang zlib1g-dev libarchive-dev
       - name: Release build + tests
         run: |
-          cmake -S . -B build/linux -G Ninja -DAV_OFFLINE=ON -DCMAKE_BUILD_TYPE=Release
+          cmake -S . -B build/linux -G Ninja -DAV_OFFLINE=ON -DAV_CAPI=ON -DCMAKE_BUILD_TYPE=Release
           cmake --build build/linux
           ctest --test-dir build/linux --output-on-failure
       - name: ASan + UBSan

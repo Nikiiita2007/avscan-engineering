@@ -10,6 +10,7 @@ option(AV_ASAN "AddressSanitizer" OFF)
 option(AV_UBSAN "UndefinedBehaviorSanitizer (GCC/Clang only)" OFF)
 option(AV_TIDY "Run clang-tidy during compile" OFF)
 option(AV_FUZZ "Build libFuzzer targets (Clang only)" OFF)
+option(AV_CAPI "Build the C API shared library (avscan_capi), its C test and install rules" OFF)
 if(AV_TIDY)
  find_program(TIDY clang-tidy REQUIRED)
  set(CMAKE_CXX_CLANG_TIDY "${TIDY}")
@@ -104,4 +105,40 @@ if(AV_FUZZ)
   target_compile_options(fuzz_${kind} PRIVATE -fsanitize=fuzzer-no-link)
   target_link_options(fuzz_${kind} PRIVATE -fsanitize=fuzzer)
  endforeach()
+endif()
+
+# C API: shared library with the core linked in statically (see docs/CAPI.md).
+if(AV_CAPI)
+ enable_language(C)
+ include(GNUInstallDirs)
+ include(CMakePackageConfigHelpers)
+ set_target_properties(core PROPERTIES POSITION_INDEPENDENT_CODE ON)
+ add_library(avscan_capi SHARED libs/capi/avscan_capi.cpp)
+ target_include_directories(avscan_capi PUBLIC
+  $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/libs/capi>
+  $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>)
+ target_compile_definitions(avscan_capi PRIVATE AVSCAN_BUILD INTERFACE AVSCAN_SHARED)
+ target_link_libraries(avscan_capi PRIVATE core)
+ set_target_properties(avscan_capi PROPERTIES
+  CXX_VISIBILITY_PRESET hidden
+  VISIBILITY_INLINES_HIDDEN ON
+  VERSION ${PROJECT_VERSION}
+  SOVERSION 1
+  EXPORT_NAME capi)
+ add_library(avscan::capi ALIAS avscan_capi)
+ add_executable(capi_test tests/capi_test.c)
+ target_link_libraries(capi_test PRIVATE avscan_capi)
+ add_test(NAME capi COMMAND capi_test ${CMAKE_SOURCE_DIR}/db/signatures.db ${CMAKE_SOURCE_DIR}/tests/corpus)
+ install(TARGETS avscan_capi EXPORT avscanTargets
+  RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
+  LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
+  ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
+  INCLUDES DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
+ install(FILES libs/capi/avscan.h DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
+ install(EXPORT avscanTargets NAMESPACE avscan:: FILE avscanTargets.cmake
+  DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/avscan)
+ write_basic_package_version_file(${CMAKE_CURRENT_BINARY_DIR}/avscanConfigVersion.cmake
+  VERSION ${PROJECT_VERSION} COMPATIBILITY SameMajorVersion)
+ install(FILES cmake/avscanConfig.cmake ${CMAKE_CURRENT_BINARY_DIR}/avscanConfigVersion.cmake
+  DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/avscan)
 endif()
