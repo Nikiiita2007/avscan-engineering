@@ -1,0 +1,16 @@
+{
+  "id": "antivirus",
+  "name": "AVScan antivirus",
+  "version": "0.4.0",
+  "api_version": 1,
+  "description": "Signature scanner, directory monitor and quarantine (planned adapter around avscan_capi; the module executable does not exist yet).",
+  "entry": { "exe": "avscan-module.exe", "args": ["--module"] },
+  "capabilities": ["scan.file", "scan.buffer", "monitor.directory"],
+  "permissions": ["fs.read", "fs.write", "etw"],
+  "events": {
+    "publishes": ["antivirus.scan", "antivirus.threat", "antivirus.log"],
+    "subscribes": ["host.shutdown"]
+  },
+  "restart": { "policy": "on_failure", "max_restarts": 3 },
+  "config": { "db": "db/signatures.db", "threads": 2 }
+}

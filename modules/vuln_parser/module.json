@@ -1,0 +1,16 @@
+{
+  "id": "vuln_parser",
+  "name": "Vulnerability page parser",
+  "version": "0.1.0",
+  "api_version": 1,
+  "description": "DRAFT. Takes a URL of a vulnerability advisory and extracts CVE id, CVSS, affected and fixed versions. Module executable not written yet.",
+  "entry": { "exe": "vuln-parser.exe", "args": [] },
+  "capabilities": ["vuln.parse_url"],
+  "permissions": ["net.outbound"],
+  "events": {
+    "publishes": ["vuln_parser.result", "vuln_parser.log"],
+    "subscribes": ["host.shutdown", "antivirus.threat"]
+  },
+  "restart": { "policy": "on_failure", "max_restarts": 2 },
+  "config": { "max_response_kb": 1024, "timeout_ms": 10000 }
+}
