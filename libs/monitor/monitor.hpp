@@ -15,6 +15,8 @@ struct MonitorOptions {
  // terminate that process; optionally store an encrypted quarantine copy of the sample.
  // This is post-start termination, NOT pre-execution blocking (that needs a minifilter driver).
  bool blockExec=false,autoQuarantine=false;
+ // Console output format: false = text (default), true = one JSON object per line (see events.hpp).
+ bool jsonl=false;
 };
 using Log=std::function<void(const std::string&)>;
 Result<int> monitor(const MonitorOptions&,std::stop_token,Log);

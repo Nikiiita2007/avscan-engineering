@@ -2,6 +2,7 @@
 #include <iostream>
 #ifdef _WIN32
 #include "monitor_cli.hpp"
+#include "events.hpp"
 #include "service.hpp"
 #include "unique_handle.hpp"
 #include <shlobj.h>
@@ -28,12 +29,14 @@ int wmain(int argc,wchar_t** argv){SetConsoleOutputCP(CP_UTF8);SetConsoleCtrlHan
   if(!av::parseMonitorArgs(std::vector<std::wstring>(argv+1,argv+argc),o)){
    std::cout<<"avmonitor [--watch DIR] [--exclude DIR] [--priority DIR] [--quarantine DIR] [--db FILE] [--threads N]\n"
      "  [--etw] [--block-exec] [--auto-quarantine]   (console)\n"
+     "  [--config FILE] [--events text|jsonl]          (config file; JSON Lines output)\n"
      "  --service                                      (run as Windows service, used by SCM)\n"
      "  --install-service [--watch ... --etw ...]      (admin: install auto-start service)\n"
      "  --remove-service                               (admin: remove service)\n"
      "  --service-args \"--watch D:\\In --etw\"           (admin: change service arguments)\n";
    return 0;}
-  auto r=av::monitor(o,stop.get_token(),[](auto& s){std::cout<<s<<std::endl;});if(!r){std::cerr<<r.error().message<<'\n';return 3;}return *r;
+  const bool jsonl=o.jsonl;
+  auto r=av::monitor(o,stop.get_token(),[jsonl](const std::string& s){std::cout<<av::toEventLine(s,jsonl)<<std::endl;});if(!r){std::cerr<<r.error().message<<'\n';return 3;}return *r;
  }catch(std::exception& e){std::cerr<<e.what()<<'\n';return 4;}}
 #else
 int main(){std::cerr<<"avmonitor requires Windows\n";return 3;}
