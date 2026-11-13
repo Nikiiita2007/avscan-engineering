@@ -1,0 +1,16 @@
+{
+  "id": "net_analyzer",
+  "name": "Network analyzer",
+  "version": "0.1.0",
+  "api_version": 1,
+  "description": "DRAFT. Passive traffic analysis on the user's own machine and masking of sensitive values in its own reports. Module executable not written yet.",
+  "entry": { "exe": "net-analyzer.exe", "args": [] },
+  "capabilities": ["net.analyze", "report.mask_sensitive"],
+  "permissions": ["net.capture", "fs.write", "admin"],
+  "events": {
+    "publishes": ["net_analyzer.alert", "net_analyzer.log"],
+    "subscribes": ["host.shutdown"]
+  },
+  "restart": { "policy": "never", "max_restarts": 0 },
+  "config": { "mode": "passive", "mask_secrets": true }
+}
