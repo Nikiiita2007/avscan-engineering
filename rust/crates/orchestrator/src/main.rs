@@ -29,8 +29,8 @@ async fn main() -> Result<()> {
         let shown = entry.manifest.display();
         let text = std::fs::read_to_string(&entry.manifest)
             .with_context(|| format!("reading manifest {shown}"))?;
-        let manifest = parse_manifest(&text, HOST_API_VERSION)
-            .with_context(|| format!("manifest {shown}"))?;
+        let manifest =
+            parse_manifest(&text, HOST_API_VERSION).with_context(|| format!("manifest {shown}"))?;
         info!(
             module = %manifest.id,
             version = %manifest.version,

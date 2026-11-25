@@ -206,7 +206,9 @@ pub fn parse_manifest(text: &str, host_api: i64) -> Result<Manifest, ManifestErr
         Err(e) => return Err(ManifestError(vec![format!("invalid JSON: {e}")])),
     };
     let Some(obj) = value.as_object() else {
-        return Err(ManifestError(vec!["manifest must be a JSON object".to_string()]));
+        return Err(ManifestError(vec![
+            "manifest must be a JSON object".to_string()
+        ]));
     };
     let mut errs: Vec<String> = Vec::new();
     reject_unknown(obj, &TOP_LEVEL_KEYS, "manifest", &mut errs);
@@ -270,7 +272,10 @@ pub fn parse_manifest(text: &str, host_api: i64) -> Result<Manifest, ManifestErr
         errs.push(format!("capabilities: invalid name '{c}'"));
     }
     let permissions = string_list(obj.get("permissions"), "permissions", 16, &mut errs);
-    for p in permissions.iter().filter(|p| !ALLOWED_PERMISSIONS.contains(&p.as_str())) {
+    for p in permissions
+        .iter()
+        .filter(|p| !ALLOWED_PERMISSIONS.contains(&p.as_str()))
+    {
         errs.push(format!("permissions: unknown permission '{p}'"));
     }
 
@@ -294,7 +299,9 @@ pub fn parse_manifest(text: &str, host_api: i64) -> Result<Manifest, ManifestErr
         let base = topic.strip_suffix(".*").unwrap_or(topic.as_str());
         let own = base == own_id || base.starts_with(&format!("{own_id}."));
         if !own_id.is_empty() && !own {
-            errs.push(format!("events.publishes: '{topic}' must start with the module id"));
+            errs.push(format!(
+                "events.publishes: '{topic}' must start with the module id"
+            ));
         }
     }
     for topic in subscribes.iter().filter(|t| !valid_pattern(t)) {
@@ -398,7 +405,10 @@ mod tests {
         assert_eq!(m.exe, "net-analyzer.exe");
         assert_eq!(m.publishes, ["net_analyzer.alert", "net_analyzer.log"]);
         assert_eq!(m.restart_policy, RestartPolicy::Never);
-        assert_eq!(m.config.get("mode").and_then(Value::as_str), Some("passive"));
+        assert_eq!(
+            m.config.get("mode").and_then(Value::as_str),
+            Some("passive")
+        );
     }
 
     #[test]

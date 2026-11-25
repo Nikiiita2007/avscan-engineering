@@ -93,7 +93,9 @@ impl Config {
         let mut seen = HashSet::new();
         for module in &self.modules {
             if module.binary.as_os_str().is_empty() {
-                return Err(ConfigError::Invalid("module binary path is empty".to_string()));
+                return Err(ConfigError::Invalid(
+                    "module binary path is empty".to_string(),
+                ));
             }
             if !seen.insert(module.manifest.clone()) {
                 let msg = format!("duplicate manifest {}", module.manifest.display());

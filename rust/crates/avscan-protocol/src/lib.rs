@@ -137,7 +137,8 @@ fn optional_string(obj: &Map<String, Value>, key: &str) -> Result<Option<String>
 
 /// Serializes a message into one frame (little-endian length + JSON).
 pub fn encode_frame(msg: &Message) -> Result<Vec<u8>, ProtocolError> {
-    let body = serde_json::to_vec(&msg.to_value()).map_err(|e| ProtocolError::InvalidJson(e.to_string()))?;
+    let body = serde_json::to_vec(&msg.to_value())
+        .map_err(|e| ProtocolError::InvalidJson(e.to_string()))?;
     if body.is_empty() || body.len() > MAX_FRAME_BYTES {
         return Err(ProtocolError::FrameTooLarge);
     }
