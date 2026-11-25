@@ -1,0 +1,10 @@
+[package]
+name = "avscan-manifest"
+description = "module.json parsing and strict validation (mirror of libs/host/manifest.hpp)"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+serde_json.workspace = true
+thiserror.workspace = true
