@@ -3,7 +3,7 @@
 //! It lives in this crate because only the owning package gets
 //! `CARGO_BIN_EXE_log-hunter`. The orchestrator is a dev-dependency.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use avscan_manifest::{parse_manifest, HOST_API_VERSION};
@@ -18,11 +18,12 @@ const MODULE_ID: &str = "log_hunter";
 const LOG_LINE: &str =
     "Nov 26 14:02:11 host sshd[1]: Failed password for root from 203.0.113.5 port 22 ssh2\n";
 
-fn spec() -> ModuleSpec {
+fn spec(root: &Path) -> ModuleSpec {
     let text = include_str!("../../../modules/log_hunter/module.json");
     let manifest = parse_manifest(text, HOST_API_VERSION).unwrap();
     let mut config_override = Map::new();
     config_override.insert("paths".to_string(), json!([]));
+    config_override.insert("command_roots".to_string(), json!([root.to_str().unwrap()]));
     ModuleSpec {
         manifest,
         binary: PathBuf::from(env!("CARGO_BIN_EXE_log-hunter")),
@@ -64,7 +65,7 @@ async fn orchestrator_drives_the_real_module() {
     let log = dir.join("auth.log");
     std::fs::write(&log, LOG_LINE).unwrap();
 
-    let mut orch = Orchestrator::start(vec![spec()], RunOptions::default());
+    let mut orch = Orchestrator::start(vec![spec(&dir)], RunOptions::default());
     let mut events = orch.subscribe();
     wait_for(&orch, ModuleStatus::Running).await;
 
@@ -84,6 +85,17 @@ async fn orchestrator_drives_the_real_module() {
         .expect("no log event");
     assert_eq!(event.source, MODULE_ID);
     assert_eq!(event.data["message"], "analysis finished");
+
+    let mut outside = Map::new();
+    outside.insert("paths".to_string(), json!(["Cargo.toml"]));
+    let refused = orch
+        .command(MODULE_ID, "log.hunt".to_string(), outside)
+        .unwrap();
+    let refused = timeout(WAIT, refused)
+        .await
+        .expect("no answer to the refused command")
+        .expect("module ended before answering");
+    assert!(!refused.ok);
 
     let rejected = orch
         .command(MODULE_ID, "evil".to_string(), Map::new())

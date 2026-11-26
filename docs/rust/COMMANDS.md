@@ -1,6 +1,6 @@
 # Protocol: command and command_result
 
-Status: stage 6.2 (protocol, HTTP) and 6.3 (CLI client). The C++ host does not send or accept these messages yet; mirror them in `libs/host` before relying on them across both hosts.
+Status: stage 6.2 (protocol, HTTP), 6.3 (CLI client) and 6.4 (path restriction). The C++ host does not send or accept these messages yet; mirror them in `libs/host` before relying on them across both hosts.
 
 ## command (host to module)
 - `type`: `command`, `id`: request id (`cmd-N`, at most 64 chars), `module`: module id.
@@ -34,10 +34,11 @@ orchestrator exec log_hunter log.hunt --args '{"paths":["/var/log/auth.log"]}'
 
 ## Modules
 - `log_hunter` answers `log.hunt` (args: `paths`). Files are analyzed on the protocol thread, so a large file delays `ping` answers.
+- `log.hunt` reads only inside `command_roots` (module config, list of directories). Paths are resolved with symlinks before the check. Without `command_roots` the directories of the configured `paths` are used; with neither, the command is refused. With the default manifest this means `/var/log`.
 - `net-analyzer` and `vuln-scanner` do not handle `command` yet.
-- Security: the API has no authentication and `paths` is not restricted, so any local process can make the module read any file the module can read.
+- The HTTP API still has no authentication: any local process can start, stop and command modules, within each module's own limits.
 
 ## Not done yet
 - Updating `libs/host` (C++) and the message list in the `avscan-protocol` docs.
 - `command` support in `net-analyzer` and `vuln-scanner`.
-- Path allow-list or authentication for the API.
+- Authentication for the HTTP API.

@@ -8,9 +8,12 @@
 //! to the output; diagnostics go to stderr.
 //!
 //! Command `log.hunt` (args: `paths`, a list of files) analyzes the files with
-//! the rules from the start config and answers `command_result`. Files are
-//! analyzed one after another on the protocol thread, so a large file delays
-//! `ping` answers until it is done.
+//! the rules from the start config and answers `command_result`. Every path is
+//! resolved (symlinks included) and must lie inside one of the `command_roots`
+//! directories. Without `command_roots` the directories of the configured
+//! `paths` are used; with neither, the command is refused. Files are analyzed
+//! one after another on the protocol thread, so a large file delays `ping`
+//! answers until it is done.
 
 use std::fs::File;
 use std::io::{BufReader, Read, Write};
@@ -58,6 +61,8 @@ pub struct ModuleConfig {
     pub paths: Vec<PathBuf>,
     pub follow: bool,
     pub mask_secrets: bool,
+    /// Directories the `log.hunt` command may read from.
+    pub command_roots: Vec<PathBuf>,
     pub rules: Rules,
 }
 
@@ -72,6 +77,19 @@ fn paths_from(value: Option<&Value>) -> Vec<PathBuf> {
         }
     }
     paths
+}
+
+/// Explicit `command_roots`, or else the directories of the configured paths.
+fn command_roots_from(value: Option<&Value>, paths: &[PathBuf]) -> Vec<PathBuf> {
+    let configured = paths_from(value);
+    if !configured.is_empty() {
+        return configured;
+    }
+    let parents = paths
+        .iter()
+        .filter_map(|p| p.parent())
+        .filter(|p| !p.as_os_str().is_empty());
+    parents.map(Path::to_path_buf).collect()
 }
 
 fn parse_rules(value: Option<&Value>, mask: bool) -> Result<Rules, ModuleError> {
@@ -94,10 +112,13 @@ impl ModuleConfig {
             .get("follow")
             .and_then(Value::as_bool)
             .unwrap_or(false);
+        let paths = paths_from(config.get("paths"));
+        let command_roots = command_roots_from(config.get("command_roots"), &paths);
         Ok(Self {
-            paths: paths_from(config.get("paths")),
+            paths,
             follow,
             mask_secrets,
+            command_roots,
             rules: parse_rules(config.get("rules"), mask_secrets)?,
         })
     }
@@ -186,12 +207,34 @@ fn command_result(request: &Message, ok: bool, error: Option<&str>) -> Message {
     result
 }
 
+/// Resolves every path (following symlinks) and requires it to lie inside one
+/// of the roots. Returns the resolved paths or a message for the requester.
+fn check_paths(paths: &[PathBuf], roots: &[PathBuf]) -> Result<Vec<PathBuf>, String> {
+    let roots: Vec<PathBuf> = roots
+        .iter()
+        .filter_map(|root| std::fs::canonicalize(root).ok())
+        .collect();
+    if roots.is_empty() {
+        return Err("no usable command_roots are configured".to_string());
+    }
+    let mut checked = Vec::new();
+    for path in paths {
+        let real = std::fs::canonicalize(path)
+            .map_err(|e| format!("cannot resolve {}: {e}", path.display()))?;
+        if !roots.iter().any(|root| real.starts_with(root)) {
+            return Err(format!("{} is outside command_roots", path.display()));
+        }
+        checked.push(real);
+    }
+    Ok(checked)
+}
+
 /// Answers one `command`. Unknown commands and bad arguments are reported in
 /// the result (`ok: false`); they do not end the session.
 fn handle_command(
     request: &Message,
     out: &Out,
-    rules: &Rules,
+    config: &ModuleConfig,
     sink: &AlertSink,
 ) -> Result<(), ModuleError> {
     let name = request
@@ -204,13 +247,19 @@ fn handle_command(
         return out.send(&command_result(request, false, Some(text.as_str())));
     }
     let args = request.payload.get("args");
-    let paths = paths_from(args.and_then(|a| a.get("paths")));
-    if paths.is_empty() {
+    let requested = paths_from(args.and_then(|a| a.get("paths")));
+    if requested.is_empty() {
         let text = "args.paths must list at least one file";
         return out.send(&command_result(request, false, Some(text)));
     }
+    let paths = match check_paths(&requested, &config.command_roots) {
+        Ok(paths) => paths,
+        Err(text) => {
+            return out.send(&command_result(request, false, Some(text.as_str())));
+        }
+    };
     for path in &paths {
-        analyze_file(out, path, rules, sink);
+        analyze_file(out, path, &config.rules, sink);
     }
     out.send(&command_result(request, true, None))
 }
@@ -224,7 +273,7 @@ fn serve<R: Read>(
     input: &mut R,
     frames: &mut FrameReader,
     out: &Out,
-    rules: &Rules,
+    config: &ModuleConfig,
     sink: &AlertSink,
 ) -> Result<Exit, ModuleError> {
     while let Some(msg) = recv(input, frames)? {
@@ -234,7 +283,7 @@ fn serve<R: Read>(
                 pong.id = msg.id.clone();
                 out.send(&pong)?;
             }
-            "command" => handle_command(&msg, out, rules, sink)?,
+            "command" => handle_command(&msg, out, config, sink)?,
             "stop" => return Ok(Exit::Stop),
             _ => {}
         }
@@ -290,7 +339,7 @@ pub fn run<R: Read>(mut input: R, output: Box<dyn Write + Send>) -> Result<(), M
         }
     }
 
-    let exit = serve(&mut input, &mut frames, &out, &config.rules, &sink);
+    let exit = serve(&mut input, &mut frames, &out, &config, &sink);
     drop(followers);
     if matches!(exit?, Exit::Stop) {
         out.send(&reply("stopped", json!({})))?;
@@ -390,6 +439,19 @@ mod tests {
         replies
     }
 
+    /// Runs hello, start with `config`, one `log.hunt` command and stop.
+    fn hunt_session(config: Value, paths: Value) -> Vec<Message> {
+        let messages = vec![
+            host_msg("hello", json!({ "host_api": 1 })),
+            host_msg("start", json!({ "config": config })),
+            command_msg("cmd-1", "log.hunt", json!({ "paths": paths })),
+            host_msg("stop", json!({})),
+        ];
+        let (result, replies) = run_raw(messages);
+        result.unwrap();
+        replies
+    }
+
     fn types(replies: &[Message]) -> Vec<&str> {
         replies.iter().map(|m| m.msg_type.as_str()).collect()
     }
@@ -460,15 +522,9 @@ mod tests {
     fn log_hunt_command_analyzes_the_requested_files() {
         let dir = TempDir::new("module_command");
         let path = burst_log(&dir);
-        let args = json!({ "paths": [path.to_str().unwrap()] });
-        let messages = vec![
-            host_msg("hello", json!({ "host_api": 1 })),
-            host_msg("start", json!({ "config": {} })),
-            command_msg("cmd-1", "log.hunt", args),
-            host_msg("stop", json!({})),
-        ];
-        let (result, replies) = run_raw(messages);
-        result.unwrap();
+        let root = dir.path().to_str().unwrap().to_string();
+        let config = json!({ "command_roots": [root] });
+        let replies = hunt_session(config, json!([path.to_str().unwrap()]));
         assert_eq!(
             types(&replies),
             [
@@ -483,6 +539,44 @@ mod tests {
         assert_eq!(replies[2].payload["data"]["rule"], "ssh-bruteforce");
         assert_eq!(replies[4].id.as_deref(), Some("cmd-1"));
         assert_eq!(replies[4].payload["ok"], json!(true));
+    }
+
+    #[test]
+    fn log_hunt_command_refuses_paths_outside_the_roots() {
+        let allowed = TempDir::new("module_roots_allowed");
+        let other = TempDir::new("module_roots_other");
+        let outside = burst_log(&other);
+        let root = allowed.path().to_str().unwrap().to_string();
+        let config = json!({ "command_roots": [root] });
+        let replies = hunt_session(config, json!([outside.to_str().unwrap()]));
+        assert_eq!(
+            types(&replies),
+            ["hello_ack", "started", "command_result", "stopped"]
+        );
+        assert_eq!(replies[2].payload["ok"], json!(false));
+        let error = replies[2].payload["error"].as_str().unwrap();
+        assert!(error.contains("outside command_roots"));
+    }
+
+    #[test]
+    fn log_hunt_command_needs_configured_roots() {
+        let dir = TempDir::new("module_no_roots");
+        let path = burst_log(&dir);
+        let replies = hunt_session(json!({}), json!([path.to_str().unwrap()]));
+        assert_eq!(replies[2].msg_type, "command_result");
+        assert_eq!(replies[2].payload["ok"], json!(false));
+        let error = replies[2].payload["error"].as_str().unwrap();
+        assert!(error.contains("command_roots"));
+    }
+
+    #[test]
+    fn command_roots_default_to_the_directories_of_the_paths() {
+        let paths = [PathBuf::from("/var/log/auth.log"), PathBuf::from("local.log")];
+        let roots = command_roots_from(None, &paths);
+        assert_eq!(roots, [PathBuf::from("/var/log")]);
+        let explicit = json!(["/srv/logs"]);
+        let roots = command_roots_from(Some(&explicit), &paths);
+        assert_eq!(roots, [PathBuf::from("/srv/logs")]);
     }
 
     #[test]
@@ -588,6 +682,7 @@ mod tests {
         let config = ModuleConfig::from_value(&Value::Null).unwrap();
         assert!(config.mask_secrets && config.rules.mask_names);
         assert!(config.paths.is_empty() && !config.follow);
+        assert!(config.command_roots.is_empty());
         let open = ModuleConfig::from_value(&json!({ "mask_secrets": false })).unwrap();
         assert!(!open.rules.mask_names);
     }
