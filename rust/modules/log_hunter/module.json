@@ -1,0 +1,16 @@
+{
+  "id": "log_hunter",
+  "name": "Log hunter",
+  "version": "0.1.0",
+  "api_version": 1,
+  "description": "Parses authentication logs (for example /var/log/auth.log) and reports indicators of compromise: brute force, user enumeration, logins after failures, suspicious addresses.",
+  "entry": { "exe": "log-hunter", "args": [] },
+  "capabilities": ["log.hunt", "report.mask_sensitive"],
+  "permissions": ["fs.read"],
+  "events": {
+    "publishes": ["log_hunter.ioc", "log_hunter.log"],
+    "subscribes": ["host.shutdown"]
+  },
+  "restart": { "policy": "on_failure", "max_restarts": 2 },
+  "config": { "paths": ["/var/log/auth.log"], "follow": false, "mask_secrets": true }
+}
