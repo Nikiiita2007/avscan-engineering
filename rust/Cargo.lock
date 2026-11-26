@@ -455,10 +455,12 @@ name = "net-analyzer"
 version = "0.1.0"
 dependencies = [
  "avscan-manifest",
+ "avscan-orchestrator",
  "avscan-protocol",
  "serde",
  "serde_json",
  "thiserror",
+ "tokio",
 ]
 
 [[package]]
@@ -870,11 +872,13 @@ name = "vuln-scanner"
 version = "0.1.0"
 dependencies = [
  "avscan-manifest",
+ "avscan-orchestrator",
  "avscan-protocol",
  "regex",
  "serde",
  "serde_json",
  "thiserror",
+ "tokio",
 ]
 
 [[package]]
