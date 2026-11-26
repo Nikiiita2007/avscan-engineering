@@ -1,0 +1,16 @@
+{
+  "id": "vuln_scanner",
+  "name": "Vulnerability scanner",
+  "version": "0.1.0",
+  "api_version": 1,
+  "description": "Scans Dockerfile, package.json, requirements.txt and config files for secrets, outdated dependencies and risky Docker practices.",
+  "entry": { "exe": "vuln-scanner", "args": [] },
+  "capabilities": ["vuln.scan_files", "report.mask_sensitive"],
+  "permissions": ["fs.read"],
+  "events": {
+    "publishes": ["vuln_scanner.report", "vuln_scanner.log"],
+    "subscribes": ["host.shutdown", "vuln_scanner.scan"]
+  },
+  "restart": { "policy": "on_failure", "max_restarts": 2 },
+  "config": { "paths": [], "max_depth": 8, "max_file_kb": 1024, "max_findings": 500 }
+}
