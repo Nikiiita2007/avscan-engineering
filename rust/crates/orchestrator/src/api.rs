@@ -1,6 +1,8 @@
 //! HTTP API: module status, module control and a live SSE subscription.
 //!
-//! The API deliberately permits only loopback binds. Control routes:
+//! The API deliberately permits only loopback binds. `GET /modules` lists the
+//! state of every module together with the capabilities of its manifest;
+//! those names are the valid command names. Control routes:
 //! `POST /modules/{id}/start`, `POST /modules/{id}/stop` and
 //! `POST /modules/{id}/command` (body: `name`, optional `args`). The command
 //! `name` must be a capability declared by the module. `POST /events`
@@ -35,7 +37,7 @@ use serde_json::{json, Map, Value};
 use tokio::sync::broadcast::error::RecvError;
 use tokio::sync::Mutex;
 
-use crate::supervisor::{ControlError, ModuleStatus, Orchestrator};
+use crate::supervisor::{ControlError, ModuleInfo, ModuleStatus, Orchestrator};
 
 pub type Shared = Arc<Mutex<Orchestrator>>;
 
@@ -52,6 +54,7 @@ struct Status {
     state: &'static str,
     restart_attempt: Option<u32>,
     error: Option<String>,
+    capabilities: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -68,8 +71,8 @@ struct PublishRequest {
     data: Value,
 }
 
-fn status(id: String, value: ModuleStatus) -> Status {
-    let (state, restart_attempt, error) = match value {
+fn status(info: ModuleInfo) -> Status {
+    let (state, restart_attempt, error) = match info.status {
         ModuleStatus::Starting => ("starting", None, None),
         ModuleStatus::Running => ("running", None, None),
         ModuleStatus::Restarting { attempt } => ("restarting", Some(attempt), None),
@@ -77,10 +80,11 @@ fn status(id: String, value: ModuleStatus) -> Status {
         ModuleStatus::Failed(reason) => ("failed", None, Some(reason)),
     };
     Status {
-        id,
+        id: info.id,
         state,
         restart_attempt,
         error,
+        capabilities: info.capabilities,
     }
 }
 
@@ -189,8 +193,8 @@ async fn health() -> Json<Value> {
 }
 
 async fn modules(State(shared): State<Shared>) -> Json<Vec<Status>> {
-    let values = shared.lock().await.statuses();
-    Json(values.into_iter().map(|(id, s)| status(id, s)).collect())
+    let values = shared.lock().await.describe();
+    Json(values.into_iter().map(status).collect())
 }
 
 async fn start(
@@ -314,10 +318,13 @@ pub fn router_with_token(shared: Shared, token: Option<String>) -> Router {
 mod tests {
     use super::*;
 
+    use std::path::PathBuf;
+
+    use avscan_manifest::{parse_manifest, HOST_API_VERSION};
     use axum::body::{to_bytes, Body};
     use tower::ServiceExt;
 
-    use crate::supervisor::RunOptions;
+    use crate::supervisor::{ModuleSpec, RunOptions};
 
     fn app() -> Router {
         let orchestrator = Orchestrator::start(Vec::new(), RunOptions::default());
@@ -383,6 +390,25 @@ mod tests {
         let bytes = to_bytes(response.into_body(), 4096).await.unwrap();
         let value: Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(value, json!([]));
+    }
+
+    #[tokio::test]
+    async fn modules_list_their_capabilities() {
+        let text = r#"{"id":"ghost_mod","name":"Ghost","version":"0.1.0","api_version":1,"entry":{"exe":"ghost"},"capabilities":["scan.run"],"restart":{"policy":"never","max_restarts":0}}"#;
+        let spec = ModuleSpec {
+            manifest: parse_manifest(text, HOST_API_VERSION).unwrap(),
+            binary: PathBuf::from("definitely-missing-binary-xyz"),
+            extra_args: Vec::new(),
+            config_override: Map::new(),
+        };
+        let orchestrator = Orchestrator::start(vec![spec], RunOptions::default());
+        let app = router(Arc::new(Mutex::new(orchestrator)));
+        let response = app.oneshot(get_request("/modules", None)).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = to_bytes(response.into_body(), 4096).await.unwrap();
+        let value: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(value[0]["id"], "ghost_mod");
+        assert_eq!(value[0]["capabilities"], json!(["scan.run"]));
     }
 
     #[tokio::test]
@@ -594,10 +620,16 @@ mod tests {
 
     #[test]
     fn failure_details_and_restart_attempts_are_preserved() {
-        let failed = status("x".into(), ModuleStatus::Failed("reason".into()));
+        let info = |value: ModuleStatus| ModuleInfo {
+            id: "x".to_string(),
+            status: value,
+            capabilities: vec!["scan.run".to_string()],
+        };
+        let failed = status(info(ModuleStatus::Failed("reason".into())));
         assert_eq!(failed.state, "failed");
         assert_eq!(failed.error.as_deref(), Some("reason"));
-        let restarting = status("x".into(), ModuleStatus::Restarting { attempt: 2 });
+        assert_eq!(failed.capabilities, ["scan.run"]);
+        let restarting = status(info(ModuleStatus::Restarting { attempt: 2 }));
         assert_eq!(restarting.restart_attempt, Some(2));
     }
 }

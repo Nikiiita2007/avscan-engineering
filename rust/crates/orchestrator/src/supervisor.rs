@@ -37,6 +37,15 @@ pub enum ModuleStatus {
     Failed(String),
 }
 
+/// Read-only description of a module for status views.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModuleInfo {
+    pub id: String,
+    pub status: ModuleStatus,
+    /// Capabilities declared in the manifest; commands must use these names.
+    pub capabilities: Vec<String>,
+}
+
 /// Why a control request (start, stop, command) was refused.
 #[derive(Debug, Clone, Error, PartialEq, Eq)]
 pub enum ControlError {
@@ -301,6 +310,16 @@ impl Orchestrator {
         self.modules.iter().map(current).collect()
     }
 
+    /// Status and declared capabilities of every module.
+    pub fn describe(&self) -> Vec<ModuleInfo> {
+        let info = |m: &ModuleEntry| ModuleInfo {
+            id: m.spec.manifest.id.clone(),
+            status: m.status.borrow().clone(),
+            capabilities: m.spec.manifest.capabilities.clone(),
+        };
+        self.modules.iter().map(info).collect()
+    }
+
     fn entry(&self, id: &str) -> Result<&ModuleEntry, ControlError> {
         let found = self.modules.iter().find(|m| m.spec.manifest.id == id);
         found.ok_or_else(|| ControlError::UnknownModule(id.to_string()))
@@ -496,6 +515,20 @@ mod tests {
         assert_eq!(event.topic, "host.scan");
         assert_eq!(event.source, HOST_SOURCE);
         assert_eq!(event.data["path"], "/x");
+        orch.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn describe_lists_the_manifest_capabilities() {
+        let text = r#"{"id":"ghost_mod","name":"Ghost","version":"0.1.0","api_version":1,"entry":{"exe":"ghost"},"capabilities":["scan.run","report.mask_sensitive"],"restart":{"policy":"never","max_restarts":0}}"#;
+        let mut spec = spec_for("never", 0);
+        spec.manifest = parse_manifest(text, HOST_API_VERSION).unwrap();
+        let orch = Orchestrator::start(vec![spec], fast_opts());
+        let info = orch.describe();
+        assert_eq!(info.len(), 1);
+        assert_eq!(info[0].id, "ghost_mod");
+        assert_eq!(info[0].capabilities, ["scan.run", "report.mask_sensitive"]);
+        assert_eq!(orch.statuses().len(), 1);
         orch.shutdown().await;
     }
 }
