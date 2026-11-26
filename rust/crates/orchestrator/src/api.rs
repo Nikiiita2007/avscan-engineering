@@ -8,6 +8,11 @@
 //! modules whose manifest subscribes to the topic receive it. SSE has no
 //! replay; lag is reported explicitly.
 //!
+//! Requests that a web page could send are refused with 403: a `Host` header
+//! that is not a loopback name (DNS rebinding) and an `Origin` header that is
+//! not this very server (cross-site requests). Clients without these headers,
+//! such as curl and the CLI, are not affected.
+//!
 //! With a token every route except `GET /health` requires the header
 //! `Authorization: Bearer <token>`; without one the API is open to every local
 //! process. The token travels in clear text, which is acceptable on loopback.
@@ -17,7 +22,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use axum::extract::{Path, Request, State};
-use axum::http::header::{AUTHORIZATION, WWW_AUTHENTICATE};
+use axum::http::header::{AUTHORIZATION, HOST, ORIGIN, WWW_AUTHENTICATE};
 use axum::http::StatusCode;
 use axum::middleware::{self, Next};
 use axum::response::sse::{Event, KeepAlive, Sse};
@@ -92,11 +97,61 @@ fn bad_request(text: &str) -> ApiError {
     (StatusCode::BAD_REQUEST, Json(json!({"error": text})))
 }
 
+fn forbidden(text: &str) -> Response {
+    (StatusCode::FORBIDDEN, Json(json!({"error": text}))).into_response()
+}
+
 /// Lowercase letters, digits, `_` and `.`; no empty segments.
 fn valid_topic(topic: &str) -> bool {
     let allowed = |c: char| c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '_' | '.');
     let shaped = !topic.starts_with('.') && !topic.ends_with('.') && !topic.contains("..");
     (1..=MAX_TOPIC_LEN).contains(&topic.len()) && shaped && topic.chars().all(allowed)
+}
+
+/// Name part of a `Host` header value: the port is cut off, IPv6 brackets stay.
+fn host_name(authority: &str) -> &str {
+    if authority.starts_with('[') {
+        return authority
+            .find(']')
+            .map_or(authority, |end| &authority[..=end]);
+    }
+    match authority.rsplit_once(':') {
+        Some((name, port)) if port.chars().all(|c| c.is_ascii_digit()) => name,
+        _ => authority,
+    }
+}
+
+fn is_loopback_host(authority: &str) -> bool {
+    let name = host_name(authority);
+    name == "127.0.0.1" || name == "[::1]" || name.eq_ignore_ascii_case("localhost")
+}
+
+/// Refuses requests that a web page could send. A `Host` that is not a
+/// loopback name is a DNS rebinding attempt. An `Origin` must be this server
+/// itself (`http://` plus the `Host` value); browsers send it on cross-site
+/// requests, so a foreign page cannot control the API.
+async fn guard_origin(request: Request, next: Next) -> Response {
+    let headers = request.headers();
+    let host = headers.get(HOST).and_then(|value| value.to_str().ok());
+    if let Some(host) = host {
+        if !is_loopback_host(host) {
+            return forbidden("the Host header is not a loopback address");
+        }
+    }
+    if let Some(origin) = headers.get(ORIGIN) {
+        let authority = origin
+            .to_str()
+            .ok()
+            .and_then(|value| value.strip_prefix("http://"));
+        let same = match (authority, host) {
+            (Some(authority), Some(host)) => authority.eq_ignore_ascii_case(host),
+            _ => false,
+        };
+        if !same {
+            return forbidden("cross-origin requests are not allowed");
+        }
+    }
+    next.run(request).await
 }
 
 /// Compares in time that depends only on the length of the expected token.
@@ -235,6 +290,7 @@ pub fn router(shared: Shared) -> Router {
 
 /// SSE is live-only: clients receive events published after subscribing.
 /// With `Some(token)` every route except `/health` needs that bearer token.
+/// The Host and Origin guard runs first and covers every route.
 pub fn router_with_token(shared: Shared, token: Option<String>) -> Router {
     let app = Router::new()
         .route("/health", get(health))
@@ -244,13 +300,14 @@ pub fn router_with_token(shared: Shared, token: Option<String>) -> Router {
         .route("/modules/{id}/command", post(command))
         .route("/events", get(events).post(publish))
         .with_state(shared);
-    match token {
+    let app = match token {
         Some(token) => {
             let guard = middleware::from_fn_with_state(Arc::new(token), require_token);
             app.layer(guard)
         }
         None => app,
-    }
+    };
+    app.layer(middleware::from_fn(guard_origin))
 }
 
 #[cfg(test)]
@@ -276,6 +333,14 @@ mod tests {
         let mut builder = Request::builder().uri(uri);
         if let Some(value) = auth {
             builder = builder.header("authorization", value);
+        }
+        builder.body(Body::empty()).unwrap()
+    }
+
+    fn request_with(method: &str, uri: &str, headers: &[(&str, &str)]) -> Request<Body> {
+        let mut builder = Request::builder().method(method).uri(uri);
+        for (name, value) in headers {
+            builder = builder.header(*name, *value);
         }
         builder.body(Body::empty()).unwrap()
     }
@@ -354,6 +419,69 @@ mod tests {
             .unwrap();
         let response = app().oneshot(req).await.unwrap();
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn foreign_hosts_are_refused() {
+        let foreign = ["evil.example", "evil.example:8787", "10.0.0.5:8787"];
+        let rebinding = ["127.0.0.1.evil.example", "localhost.evil.example"];
+        for host in foreign.iter().chain(rebinding.iter()) {
+            let req = request_with("GET", "/health", &[("host", host)]);
+            let status = status_of(app(), req).await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{host}");
+        }
+    }
+
+    #[tokio::test]
+    async fn loopback_hosts_are_accepted() {
+        let local = ["127.0.0.1:8787", "localhost:8787", "LOCALHOST", "[::1]:8787"];
+        for host in local {
+            let req = request_with("GET", "/health", &[("host", host)]);
+            let status = status_of(app(), req).await;
+            assert_eq!(status, StatusCode::OK, "{host}");
+        }
+    }
+
+    #[tokio::test]
+    async fn cross_site_requests_are_refused() {
+        let host = ("host", "127.0.0.1:8787");
+        let foreign = ["http://evil.example", "https://127.0.0.1:8787", "null"];
+        let other = ["http://127.0.0.1:9999", "http://localhost:8787"];
+        for origin in foreign.iter().chain(other.iter()) {
+            let headers = [host, ("origin", origin)];
+            let req = request_with("POST", "/modules/missing/stop", &headers);
+            let status = status_of(app(), req).await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{origin}");
+        }
+    }
+
+    #[tokio::test]
+    async fn same_origin_and_headerless_requests_pass_the_guard() {
+        let host = ("host", "127.0.0.1:8787");
+        let same = [host, ("origin", "http://127.0.0.1:8787")];
+        let req = request_with("POST", "/modules/missing/stop", &same);
+        assert_eq!(status_of(app(), req).await, StatusCode::NOT_FOUND);
+        let req = request_with("POST", "/modules/missing/stop", &[host]);
+        assert_eq!(status_of(app(), req).await, StatusCode::NOT_FOUND);
+        let req = request_with("POST", "/modules/missing/stop", &[]);
+        assert_eq!(status_of(app(), req).await, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn an_origin_without_a_host_is_refused() {
+        let headers = [("origin", "http://127.0.0.1:8787")];
+        let req = request_with("POST", "/modules/missing/stop", &headers);
+        assert_eq!(status_of(app(), req).await, StatusCode::FORBIDDEN);
+    }
+
+    #[test]
+    fn host_names_are_extracted() {
+        assert_eq!(host_name("127.0.0.1:8787"), "127.0.0.1");
+        assert_eq!(host_name("localhost"), "localhost");
+        assert_eq!(host_name("[::1]:8787"), "[::1]");
+        assert_eq!(host_name("[::1]"), "[::1]");
+        assert!(is_loopback_host("[::1]:1"));
+        assert!(!is_loopback_host("[::2]:1"));
     }
 
     #[tokio::test]
@@ -439,6 +567,15 @@ mod tests {
             status_of(app_with_token(token), events).await,
             StatusCode::UNAUTHORIZED
         );
+    }
+
+    #[tokio::test]
+    async fn the_guard_runs_before_the_token_check() {
+        let token = "0123456789abcdef";
+        let headers = [("host", "evil.example")];
+        let req = request_with("GET", "/health", &headers);
+        let status = status_of(app_with_token(token), req).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
     }
 
     #[test]
