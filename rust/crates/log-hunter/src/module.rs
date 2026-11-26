@@ -430,13 +430,15 @@ mod tests {
         assert_eq!(kinds.last(), Some(&"stopped"));
         let rules: Vec<&Value> = replies
             .iter()
-            .filter(|m| m.payload["topic"] == IOC_TOPIC)
+            .filter(|m| m.payload.get("topic") == Some(&json!(IOC_TOPIC)))
             .map(|m| &m.payload["data"]["rule"])
             .collect();
         assert_eq!(rules, ["ssh-bruteforce"]);
-        assert!(replies.iter().any(|m| m.payload["data"]["message"]
-            .as_str()
-            .is_some_and(|t| t.starts_with("following"))));
+        let following = replies.iter().any(|m| {
+            let text = m.payload.get("data").and_then(|d| d["message"].as_str());
+            text.is_some_and(|t| t.starts_with("following"))
+        });
+        assert!(following);
     }
 
     #[test]
