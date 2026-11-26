@@ -5,6 +5,7 @@ members = [
     "crates/avscan-manifest",
     "crates/orchestrator",
     "crates/vuln-scanner",
+    "crates/net-analyzer",
 ]
 
 [workspace.package]
