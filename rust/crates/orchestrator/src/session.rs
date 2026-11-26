@@ -9,6 +9,12 @@
 //! `id`; the module answers `command_result` with the same `id` and a payload
 //! `ok` (bool) and optional `error` (string). The command name must be one of
 //! the capabilities declared in the module manifest.
+//!
+//! Bus events whose topic matches the manifest `subscribes` list are sent to
+//! the module as `event` messages (payload: `topic`, `data`, `source`). A
+//! module never receives its own events. The session subscribes to the bus
+//! when it is created, so events published while the handshake runs are
+//! delivered after the module has started.
 
 use std::collections::HashMap;
 use std::time::Duration;
@@ -18,6 +24,7 @@ use avscan_protocol::{encode_frame, FrameReader, Message, ProtocolError};
 use serde_json::{json, Map, Value};
 use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::sync::broadcast::error::RecvError;
 use tokio::sync::{broadcast, mpsc, oneshot, watch};
 use tokio::time::Instant;
 use tracing::{info, warn};
@@ -144,6 +151,7 @@ pub enum SessionEnd {
 enum Wake {
     Shutdown,
     Command(HostCommand),
+    Published(Result<BusEvent, RecvError>),
     Received(Result<Message, HostError>),
 }
 
@@ -152,6 +160,7 @@ pub struct Session<R, W> {
     conn: Connection<R, W>,
     manifest: Manifest,
     bus: broadcast::Sender<BusEvent>,
+    events: broadcast::Receiver<BusEvent>,
     timeouts: Timeouts,
     running: bool,
     ping_seq: u32,
@@ -167,10 +176,12 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> Session<R, W> {
         bus: broadcast::Sender<BusEvent>,
         timeouts: Timeouts,
     ) -> Self {
+        let events = bus.subscribe();
         Self {
             conn,
             manifest,
             bus,
+            events,
             timeouts,
             running: false,
             ping_seq: 0,
@@ -255,6 +266,7 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> Session<R, W> {
             let wake = tokio::select! {
                 _ = shutdown.changed() => Wake::Shutdown,
                 Some(command) = commands.recv() => Wake::Command(command),
+                published = self.events.recv() => Wake::Published(published),
                 received = self.conn.recv(idle) => Wake::Received(received),
             };
             match wake {
@@ -267,6 +279,17 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> Session<R, W> {
                     if let Err(e) = self.send_command(command).await {
                         return SessionEnd::Failed(e.to_string());
                     }
+                }
+                Wake::Published(Ok(event)) => {
+                    if let Err(e) = self.forward_event(&event).await {
+                        return SessionEnd::Failed(e.to_string());
+                    }
+                }
+                Wake::Published(Err(RecvError::Lagged(missed))) => {
+                    warn!(module = %self.manifest.id, missed, "dropped bus events");
+                }
+                Wake::Published(Err(RecvError::Closed)) => {
+                    return SessionEnd::Failed("event bus closed".to_string());
                 }
                 Wake::Received(Ok(msg)) => {
                     if let Err(e) = self.dispatch(&msg) {
@@ -281,6 +304,24 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> Session<R, W> {
                 Wake::Received(Err(e)) => return SessionEnd::Failed(e.to_string()),
             }
         }
+    }
+
+    /// Sends a bus event to the module when its topic matches `subscribes`.
+    /// Events the module published itself are not sent back.
+    async fn forward_event(&mut self, event: &BusEvent) -> Result<(), HostError> {
+        if event.source == self.manifest.id {
+            return Ok(());
+        }
+        if !topic_allowed(&self.manifest.subscribes, &event.topic) {
+            return Ok(());
+        }
+        let payload = json!({
+            "topic": event.topic,
+            "data": event.data,
+            "source": event.source,
+        });
+        let msg = self.base("event").with_payload(payload);
+        self.conn.send(&msg).await
     }
 
     /// Sends a `command` after checking the declared capabilities and the
@@ -470,6 +511,11 @@ mod tests {
         parse_manifest(text, HOST_API_VERSION).unwrap()
     }
 
+    fn subscribing_manifest() -> Manifest {
+        let text = r#"{"id":"log_hunter","name":"Log hunter","version":"0.1.0","api_version":1,"entry":{"exe":"log-hunter"},"capabilities":["log.hunt"],"events":{"publishes":["log_hunter.ioc"],"subscribes":["host.*"]}}"#;
+        parse_manifest(text, HOST_API_VERSION).unwrap()
+    }
+
     fn fast() -> Timeouts {
         let t = Duration::from_millis(200);
         Timeouts {
@@ -599,6 +645,52 @@ mod tests {
         let (end, dropped) = timeout(WAIT, runner).await.unwrap().unwrap();
         assert_eq!(end, SessionEnd::Shutdown { graceful: true });
         assert_eq!(dropped, 1);
+    }
+
+    #[tokio::test]
+    async fn bus_events_reach_a_subscribed_module() {
+        let (seen_tx, seen_rx) = oneshot::channel();
+        let (host, mut module) = pipe();
+        tokio::spawn(async move {
+            answer_hello(&mut module, reply("hello_ack", good_ack())).await;
+            answer_start(&mut module).await;
+            let event = module.recv(WAIT).await.unwrap();
+            assert_eq!(event.msg_type, "event");
+            assert_eq!(event.payload["topic"], "host.scan");
+            assert_eq!(event.payload["source"], "host");
+            assert_eq!(event.payload["data"]["path"], "/x");
+            let _ = seen_tx.send(());
+            let stop = module.recv(WAIT).await.unwrap();
+            assert_eq!(stop.msg_type, "stop");
+            module.send(&reply("stopped", json!({}))).await.unwrap();
+        });
+
+        let bus = new_bus();
+        let mut session = Session::new(host, subscribing_manifest(), bus.clone(), fast());
+        session.start(&Map::new()).await.unwrap();
+        let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
+        let (_command_tx, mut command_rx) = mpsc::channel(1);
+        let runner = tokio::spawn(async move {
+            let idle = Duration::from_secs(1);
+            session.run(&mut shutdown_rx, &mut command_rx, idle).await
+        });
+
+        let publish = |topic: &str, source: &str| {
+            let event = BusEvent {
+                topic: topic.to_string(),
+                data: json!({ "path": "/x" }),
+                source: source.to_string(),
+            };
+            let _ = bus.send(event);
+        };
+        publish("other.topic", "host");
+        publish("host.own", "log_hunter");
+        publish("host.scan", "host");
+
+        timeout(WAIT, seen_rx).await.unwrap().unwrap();
+        shutdown_tx.send(true).unwrap();
+        let end = timeout(WAIT, runner).await.unwrap().unwrap();
+        assert_eq!(end, SessionEnd::Shutdown { graceful: true });
     }
 
     #[tokio::test]
