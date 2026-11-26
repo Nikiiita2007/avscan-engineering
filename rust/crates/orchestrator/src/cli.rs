@@ -60,6 +60,23 @@ pub enum Command {
         #[command(flatten)]
         api: ApiArgs,
     },
+    /// Publish an event from the host on the bus.
+    Publish {
+        topic: String,
+        /// JSON object with the event data.
+        #[arg(long, default_value = "{}")]
+        data: String,
+        #[command(flatten)]
+        api: ApiArgs,
+    },
+    /// Print the most recent bus events the orchestrator remembers.
+    History {
+        /// How many events to print (the server allows at most 500).
+        #[arg(long)]
+        limit: Option<usize>,
+        #[command(flatten)]
+        api: ApiArgs,
+    },
 }
 
 #[cfg(test)]
@@ -120,6 +137,21 @@ mod tests {
             }
             other => panic!("unexpected command {other:?}"),
         }
+    }
+
+    #[test]
+    fn parses_publish_and_history() {
+        let args = ["orchestrator", "publish", "host.ping", "--data", "{}"];
+        let cli = Cli::try_parse_from(args).unwrap();
+        assert!(matches!(cli.command, Command::Publish { .. }));
+        let args = ["orchestrator", "history", "--limit", "5"];
+        let cli = Cli::try_parse_from(args).unwrap();
+        match cli.command {
+            Command::History { limit, .. } => assert_eq!(limit, Some(5)),
+            other => panic!("unexpected command {other:?}"),
+        }
+        let cli = Cli::try_parse_from(["orchestrator", "history"]).unwrap();
+        assert!(matches!(cli.command, Command::History { limit: None, .. }));
     }
 
     #[test]

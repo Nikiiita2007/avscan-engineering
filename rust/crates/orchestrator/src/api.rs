@@ -8,7 +8,8 @@
 //! `name` must be a capability declared by the module. `POST /events`
 //! (body: `topic`, optional object `data`) publishes an event from the host;
 //! modules whose manifest subscribes to the topic receive it. SSE has no
-//! replay; lag is reported explicitly.
+//! replay; lag is reported explicitly, and `GET /events/recent` returns the
+//! last events the orchestrator remembers (oldest first, no timestamps).
 //!
 //! Requests that a web page could send are refused with 403: a `Host` header
 //! that is not a loopback name (DNS rebinding) and an `Origin` header that is
@@ -23,7 +24,7 @@ use std::convert::Infallible;
 use std::sync::Arc;
 use std::time::Duration;
 
-use axum::extract::{Path, Request, State};
+use axum::extract::{Path, Query, Request, State};
 use axum::http::header::{AUTHORIZATION, HOST, ORIGIN, WWW_AUTHENTICATE};
 use axum::http::StatusCode;
 use axum::middleware::{self, Next};
@@ -37,7 +38,7 @@ use serde_json::{json, Map, Value};
 use tokio::sync::broadcast::error::RecvError;
 use tokio::sync::Mutex;
 
-use crate::supervisor::{ControlError, ModuleInfo, ModuleStatus, Orchestrator};
+use crate::supervisor::{ControlError, ModuleInfo, ModuleStatus, Orchestrator, HISTORY_LIMIT};
 
 pub type Shared = Arc<Mutex<Orchestrator>>;
 
@@ -45,6 +46,8 @@ pub type Shared = Arc<Mutex<Orchestrator>>;
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
 /// Longest accepted topic name of a published event.
 const MAX_TOPIC_LEN: usize = 64;
+/// How many events `GET /events/recent` returns without a `limit`.
+const DEFAULT_RECENT: usize = 100;
 
 type ApiError = (StatusCode, Json<Value>);
 
@@ -69,6 +72,11 @@ struct PublishRequest {
     topic: String,
     #[serde(default)]
     data: Value,
+}
+
+#[derive(Debug, Deserialize)]
+struct RecentQuery {
+    limit: Option<usize>,
 }
 
 fn status(info: ModuleInfo) -> Status {
@@ -260,6 +268,19 @@ async fn publish(
     ))
 }
 
+/// The last events the orchestrator remembers, oldest first.
+async fn recent(
+    State(shared): State<Shared>,
+    Query(query): Query<RecentQuery>,
+) -> Json<Vec<Value>> {
+    let limit = query.limit.unwrap_or(DEFAULT_RECENT).min(HISTORY_LIMIT);
+    let events = shared.lock().await.recent(limit);
+    let shown = |event: crate::bus::BusEvent| {
+        json!({"topic": event.topic, "source": event.source, "data": event.data})
+    };
+    Json(events.into_iter().map(shown).collect())
+}
+
 async fn events(
     State(shared): State<Shared>,
 ) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
@@ -303,6 +324,7 @@ pub fn router_with_token(shared: Shared, token: Option<String>) -> Router {
         .route("/modules/{id}/stop", post(stop))
         .route("/modules/{id}/command", post(command))
         .route("/events", get(events).post(publish))
+        .route("/events/recent", get(recent))
         .with_state(shared);
     let app = match token {
         Some(token) => {
@@ -409,6 +431,49 @@ mod tests {
         let value: Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(value[0]["id"], "ghost_mod");
         assert_eq!(value[0]["capabilities"], json!(["scan.run"]));
+    }
+
+    #[tokio::test]
+    async fn recent_events_are_listed_oldest_first() {
+        let orchestrator = Orchestrator::start(Vec::new(), RunOptions::default());
+        orchestrator.publish("host.one", json!({ "n": 1 }));
+        orchestrator.publish("host.two", json!({ "n": 2 }));
+        for _ in 0..300 {
+            if orchestrator.recent(10).len() >= 2 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let app = router(Arc::new(Mutex::new(orchestrator)));
+        let response = app
+            .clone()
+            .oneshot(get_request("/events/recent", None))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = to_bytes(response.into_body(), 4096).await.unwrap();
+        let value: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(value.as_array().unwrap().len(), 2);
+        assert_eq!(value[0]["topic"], "host.one");
+        assert_eq!(value[1]["source"], "host");
+        assert_eq!(value[1]["data"]["n"], 2);
+        let limited = app
+            .oneshot(get_request("/events/recent?limit=1", None))
+            .await
+            .unwrap();
+        let bytes = to_bytes(limited.into_body(), 4096).await.unwrap();
+        let value: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(value.as_array().unwrap().len(), 1);
+        assert_eq!(value[0]["topic"], "host.two");
+    }
+
+    #[tokio::test]
+    async fn recent_rejects_a_bad_limit_and_needs_the_token() {
+        let bad = status_of(app(), get_request("/events/recent?limit=abc", None)).await;
+        assert_eq!(bad, StatusCode::BAD_REQUEST);
+        let token = "0123456789abcdef";
+        let denied = status_of(app_with_token(token), get_request("/events/recent", None)).await;
+        assert_eq!(denied, StatusCode::UNAUTHORIZED);
     }
 
     #[tokio::test]

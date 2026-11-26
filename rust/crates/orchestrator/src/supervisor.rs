@@ -1,10 +1,14 @@
 //! Process supervisor: spawns module executables, runs the handshake and
 //! restarts failed modules according to their manifest restart policy.
 //! Every module has its own stop signal and bounded command queue, so one
-//! module can be started, stopped or commanded independently.
+//! module can be started, stopped or commanded independently. The orchestrator
+//! also keeps the most recent bus events, so a client that connects later can
+//! read what it missed (SSE itself has no replay).
 
+use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::process::Stdio;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -12,6 +16,7 @@ use avscan_manifest::{parse_manifest, Manifest, RestartPolicy, HOST_API_VERSION}
 use serde_json::{Map, Value};
 use thiserror::Error;
 use tokio::process::{Child, Command};
+use tokio::sync::broadcast::error::RecvError;
 use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::{broadcast, mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
@@ -24,8 +29,13 @@ use crate::session::{CommandOutcome, Connection, HostCommand, Session, SessionEn
 /// Commands that may wait for one module before the caller gets `QueueFull`.
 const COMMAND_QUEUE: usize = 16;
 
+/// How many of the most recent bus events the orchestrator remembers.
+pub const HISTORY_LIMIT: usize = 500;
+
 /// Source name of events published by the orchestrator itself.
 pub const HOST_SOURCE: &str = "host";
+
+type History = Arc<Mutex<VecDeque<BusEvent>>>;
 
 /// Lifecycle state of one supervised module.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -269,22 +279,54 @@ fn launch(spec: ModuleSpec, bus: &broadcast::Sender<BusEvent>, opts: RunOptions)
     }
 }
 
+/// Starts a task that copies every bus event into a bounded history. The
+/// task ends when the bus is closed. Events lost to lag are not recovered.
+fn record_history(bus: &broadcast::Sender<BusEvent>) -> History {
+    let history = History::default();
+    let store = Arc::clone(&history);
+    let mut events = bus.subscribe();
+    tokio::spawn(async move {
+        loop {
+            match events.recv().await {
+                Ok(event) => {
+                    if let Ok(mut queue) = store.lock() {
+                        if queue.len() >= HISTORY_LIMIT {
+                            queue.pop_front();
+                        }
+                        queue.push_back(event);
+                    }
+                }
+                Err(RecvError::Lagged(_)) => continue,
+                Err(RecvError::Closed) => break,
+            }
+        }
+    });
+    history
+}
+
 /// Owns the supervision tasks of all modules.
 pub struct Orchestrator {
     bus: broadcast::Sender<BusEvent>,
     opts: RunOptions,
     modules: Vec<ModuleEntry>,
+    history: History,
 }
 
 impl Orchestrator {
     /// Starts supervising every spec on its own task.
     pub fn start(specs: Vec<ModuleSpec>, opts: RunOptions) -> Self {
         let bus = new_bus();
+        let history = record_history(&bus);
         let modules = specs
             .into_iter()
             .map(|spec| launch(spec, &bus, opts))
             .collect();
-        Self { bus, opts, modules }
+        Self {
+            bus,
+            opts,
+            modules,
+            history,
+        }
     }
 
     /// Subscribes to events published by all modules.
@@ -292,16 +334,29 @@ impl Orchestrator {
         self.bus.subscribe()
     }
 
+    /// The most recent bus events, oldest first, at most `limit` of them
+    /// (and never more than `HISTORY_LIMIT`). Events carry no timestamps.
+    pub fn recent(&self, limit: usize) -> Vec<BusEvent> {
+        let Ok(queue) = self.history.lock() else {
+            return Vec::new();
+        };
+        let skip = queue.len().saturating_sub(limit);
+        queue.iter().skip(skip).cloned().collect()
+    }
+
     /// Publishes an event from the host. Modules whose manifest `subscribes`
     /// list matches the topic receive it. Returns how many receivers the bus
-    /// had (modules and SSE clients alike); it does not mean delivery.
+    /// had, not counting the history recorder (modules and SSE clients alike);
+    /// it does not mean delivery.
     pub fn publish(&self, topic: &str, data: Value) -> usize {
         let event = BusEvent {
             topic: topic.to_string(),
             data,
             source: HOST_SOURCE.to_string(),
         };
-        self.bus.send(event).unwrap_or(0)
+        self.bus
+            .send(event)
+            .map_or(0, |receivers| receivers.saturating_sub(1))
     }
 
     /// Current status of every module.
@@ -424,6 +479,16 @@ mod tests {
         }
     }
 
+    async fn wait_history(orch: &Orchestrator, want: usize) {
+        for _ in 0..300 {
+            if orch.recent(HISTORY_LIMIT + 10).len() >= want {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("the history did not reach {want} events");
+    }
+
     #[test]
     fn backoff_doubles_and_is_capped() {
         let backoff = Backoff {
@@ -529,6 +594,45 @@ mod tests {
         assert_eq!(info[0].id, "ghost_mod");
         assert_eq!(info[0].capabilities, ["scan.run", "report.mask_sensitive"]);
         assert_eq!(orch.statuses().len(), 1);
+        orch.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn recent_returns_the_latest_events_oldest_first() {
+        let orch = Orchestrator::start(Vec::new(), fast_opts());
+        for topic in ["a.one", "a.two", "a.three"] {
+            orch.publish(topic, json!({}));
+        }
+        wait_history(&orch, 3).await;
+        let topics = |limit: usize| -> Vec<String> {
+            let events = orch.recent(limit);
+            events.into_iter().map(|e| e.topic).collect()
+        };
+        assert_eq!(topics(10), ["a.one", "a.two", "a.three"]);
+        assert_eq!(topics(2), ["a.two", "a.three"]);
+        assert!(topics(0).is_empty());
+        orch.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn history_keeps_only_the_newest_events() {
+        let orch = Orchestrator::start(Vec::new(), fast_opts());
+        let total = HISTORY_LIMIT + 20;
+        for n in 0..total {
+            orch.publish(&format!("t.{n}"), json!({}));
+            tokio::task::yield_now().await;
+        }
+        for _ in 0..300 {
+            let last = orch.recent(1).pop().map(|e| e.topic);
+            if last == Some(format!("t.{}", total - 1)) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let events = orch.recent(HISTORY_LIMIT + 100);
+        assert_eq!(events.len(), HISTORY_LIMIT);
+        assert_eq!(events[0].topic, "t.20");
+        assert_eq!(events[HISTORY_LIMIT - 1].topic, format!("t.{}", total - 1));
         orch.shutdown().await;
     }
 }

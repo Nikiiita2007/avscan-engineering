@@ -1,6 +1,6 @@
 # Protocol: command and command_result
 
-Status: stage 6.2 (protocol, HTTP), 6.3 (CLI client), 6.4 (path restriction), 6.5 (API token), 6.6 (`vuln_scanner`), 6.7 (`net_analyzer`), 6.8 (C++ host), 6.9 (events to modules), 6.10 (Host and Origin guard) and 6.11 (capabilities in `GET /modules`). Both the Rust orchestrator and the C++ `ModuleHost` can send `command` and receive `command_result`.
+Status: stage 6.2 (protocol, HTTP), 6.3 (CLI client), 6.4 (path restriction), 6.5 (API token), 6.6 (`vuln_scanner`), 6.7 (`net_analyzer`), 6.8 (C++ host), 6.9 (events to modules), 6.10 (Host and Origin guard), 6.11 (capabilities in `GET /modules`) and 6.12 (event history, CLI `publish` and `history`). Both the Rust orchestrator and the C++ `ModuleHost` can send `command` and receive `command_result`.
 
 ## command (host to module)
 - `type`: `command`, `id`: request id (`cmd-N`, at most 64 chars), `module`: module id.
@@ -20,12 +20,16 @@ Status: stage 6.2 (protocol, HTTP), 6.3 (CLI client), 6.4 (path restriction), 6.
 
 ## Events to modules
 - The Rust orchestrator sends a bus event to a module as an `event` message (payload `topic`, `data`, `source`) when the topic matches the manifest `subscribes` list. A module never receives its own events. The session subscribes when it is created, so events published during the handshake are delivered after the start. A module that reads too slowly loses events (logged).
-- The host publishes events with `POST /events` (body `{"topic":"...","data":{...}}`, `data` optional and an object). Topics use lowercase letters, digits, `_` and `.` (at most 64 chars, no empty segments). The answer is 202 with the number of bus receivers; it does not mean that a module got the event. Events from the host have the source `host`.
+- The host publishes events with `POST /events` (body `{"topic":"...","data":{...}}`, `data` optional and an object). Topics use lowercase letters, digits, `_` and `.` (at most 64 chars, no empty segments). The answer is 202 with the number of bus receivers (the history recorder is not counted); it does not mean that a module got the event. Events from the host have the source `host`.
 - `vuln_scanner` reacts to `vuln_scanner.scan` (data `paths`) like to the command, but only inside `command_roots`; a refused request is reported as a `log` message because an event has no answer.
 ```sh
+orchestrator publish vuln_scanner.scan --data '{"paths":["/srv/project"]}'
 curl -X POST http://127.0.0.1:8787/events -H "Authorization: Bearer $AVSCAN_TOKEN" -H 'content-type: application/json' -d '{"topic":"vuln_scanner.scan","data":{"paths":["/srv/project"]}}'
 ```
 - The C++ `ModuleHost` already forwards bus events to subscribed modules; the Rust side now matches it.
+
+## Event history
+SSE is live only, so a client that connects later would see nothing. The orchestrator therefore keeps the last 500 bus events (module events and host events) in memory. `GET /events/recent?limit=N` returns up to `N` of them, oldest first (default 100, at most 500; a non-numeric `limit` gives 400). Each item is `{topic, source, data}`; events carry no timestamps, so clients order them by position. The history is lost when the orchestrator restarts, and events that a slow recorder misses because of lag are not recovered.
 
 ## C++ host
 `ModuleHost::sendCommand(name, args, callback)` in `libs/host/module_host.hpp`:
@@ -37,6 +41,7 @@ curl -X POST http://127.0.0.1:8787/events -H "Authorization: Bearer $AVSCAN_TOKE
 - `GET /health`: `{"status":"ok"}`; the only route that needs no token.
 - `GET /modules`: a list of `{id, state, restart_attempt, error, capabilities}`. `state` is `starting`, `running`, `restarting`, `stopped` or `failed`; `restart_attempt` is set while restarting; `error` is the reason of a failure; `capabilities` are the names from the manifest and are the valid command names.
 - `GET /events`: Server-Sent Events, live only. Event `module_event` carries `{topic, source, data}`; event `lagged` carries `{dropped}`; a keep-alive comment arrives every 15 s.
+- `GET /events/recent`: the event history described above.
 - `POST /modules/{id}/start`: 202; 404 unknown module; 409 already running or still stopping.
 - `POST /modules/{id}/stop`: 202, does not wait for exit; 404; 409 not running.
 - `POST /modules/{id}/command` with `{"name":"...","args":{}}`: 200 with `{ok,error}` when the module answers; 404; 409; 429; 502 if the module ended; 504 after 30 s.
@@ -60,7 +65,7 @@ curl -H "Authorization: Bearer $AVSCAN_TOKEN" http://127.0.0.1:8787/modules
 ```
 
 ## CLI client
-The client commands talk to a running `serve` over loopback (`--api`, env `AVSCAN_API`, default `127.0.0.1:8787`). They print the JSON response and exit with a non-zero code on a non-2xx status. There is no CLI subcommand for `POST /events` yet; use curl.
+The client commands talk to a running `serve` over loopback (`--api`, env `AVSCAN_API`, default `127.0.0.1:8787`). They print the JSON response and exit with a non-zero code on a non-2xx status.
 ```sh
 orchestrator modules
 orchestrator stop log_hunter
@@ -68,6 +73,8 @@ orchestrator start log_hunter
 orchestrator exec log_hunter log.hunt --args '{"paths":["/var/log/auth.log"]}'
 orchestrator exec vuln_scanner vuln.scan_files --args '{"paths":["/srv/project"]}'
 orchestrator exec net_analyzer net.analyze --args '{"pcap_paths":["/srv/pcap/capture.pcap"]}'
+orchestrator publish host.ping --data '{}'
+orchestrator history --limit 20
 ```
 
 ## Modules
@@ -85,3 +92,4 @@ orchestrator exec net_analyzer net.analyze --args '{"pcap_paths":["/srv/pcap/cap
 - The message type list in the comment of `libs/host/protocol.hpp` and in the protocol specification does not mention `command` and `command_result` yet.
 - The C++ host has no HTTP or CLI front end; `sendCommand` is a library call only.
 - The API does not report each module's `command_roots`; see `docs/rust/STAGE9_UX_UI.md`.
+- The three modules have no common finding format; only `rule` and `severity` are confirmed.

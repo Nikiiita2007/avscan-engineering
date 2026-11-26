@@ -98,6 +98,25 @@ pub async fn run(command: &Command, token: Option<&str>) -> Result<()> {
             let body = json!({ "name": name, "args": args }).to_string();
             (api.addr, "POST", module_path(id, "command")?, Some(body))
         }
+        Command::Publish {
+            topic,
+            data,
+            api,
+        } => {
+            let data: Value = serde_json::from_str(data).context("--data must be valid JSON")?;
+            if !data.is_object() {
+                bail!("--data must be a JSON object");
+            }
+            let body = json!({ "topic": topic, "data": data }).to_string();
+            (api.addr, "POST", "/events".to_string(), Some(body))
+        }
+        Command::History { limit, api } => {
+            let path = match limit {
+                Some(count) => format!("/events/recent?limit={count}"),
+                None => "/events/recent".to_string(),
+            };
+            (api.addr, "GET", path, None)
+        }
         Command::Validate | Command::Serve { .. } => bail!("not a client command"),
     };
     let (status, text) = request(addr, method, &path, body.as_deref(), token).await?;
@@ -171,6 +190,29 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(status, 404);
+    }
+
+    #[tokio::test]
+    async fn publish_and_history_reach_the_server() {
+        let addr = serve_empty(None).await;
+        let body = r#"{"topic":"host.ping","data":{}}"#;
+        let (status, _) = request(addr, "POST", "/events", Some(body), None)
+            .await
+            .unwrap();
+        assert_eq!(status, 202);
+        let mut seen = String::new();
+        for _ in 0..100 {
+            let (status, text) = request(addr, "GET", "/events/recent?limit=5", None, None)
+                .await
+                .unwrap();
+            assert_eq!(status, 200);
+            seen = text;
+            if seen.contains("host.ping") {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(seen.contains("host.ping"), "history was {seen}");
     }
 
     #[tokio::test]
