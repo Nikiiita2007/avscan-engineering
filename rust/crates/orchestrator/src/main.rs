@@ -1,10 +1,11 @@
-//! Orchestrator entry point (stage 1 skeleton: load config, validate manifests).
+//! Orchestrator entry point: loads the configuration, supervises the modules
+//! listed in it and stops them on Ctrl+C.
 
 use std::path::Path;
 
 use anyhow::{Context, Result};
-use avscan_manifest::{parse_manifest, HOST_API_VERSION};
 use avscan_orchestrator::config::Config;
+use avscan_orchestrator::supervisor::{load_specs, Orchestrator, RunOptions};
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 
@@ -25,19 +26,17 @@ async fn main() -> Result<()> {
         .unwrap_or_else(|| "orchestrator.json".to_string());
     let config = Config::from_file(Path::new(&path))?;
     info!(config = %path, modules = config.modules.len(), "config loaded");
-    for entry in &config.modules {
-        let shown = entry.manifest.display();
-        let text = std::fs::read_to_string(&entry.manifest)
-            .with_context(|| format!("reading manifest {shown}"))?;
-        let manifest =
-            parse_manifest(&text, HOST_API_VERSION).with_context(|| format!("manifest {shown}"))?;
-        info!(
-            module = %manifest.id,
-            version = %manifest.version,
-            enabled = entry.enabled,
-            "manifest validated"
-        );
-    }
-    info!("supervisor is not implemented yet (stage 2)");
+
+    let specs = load_specs(&config)?;
+    let orchestrator = Orchestrator::start(specs, RunOptions::default());
+    info!(
+        modules = orchestrator.statuses().len(),
+        "orchestrator running, press Ctrl+C to stop"
+    );
+    tokio::signal::ctrl_c()
+        .await
+        .context("waiting for Ctrl+C")?;
+    info!("shutdown requested");
+    orchestrator.shutdown().await;
     Ok(())
 }
