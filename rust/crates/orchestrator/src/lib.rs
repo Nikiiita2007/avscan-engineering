@@ -3,6 +3,7 @@
 pub mod api;
 pub mod bus;
 pub mod cli;
+pub mod client;
 pub mod config;
 pub mod session;
 pub mod supervisor;

@@ -1,4 +1,5 @@
 //! CLI entry point. Bind HTTP before spawning modules and stop on Ctrl+C.
+//! Client commands (modules, start, stop, exec) only talk to a running server.
 
 use std::sync::Arc;
 
@@ -10,12 +11,16 @@ use tracing_subscriber::EnvFilter;
 
 use avscan_orchestrator::api;
 use avscan_orchestrator::cli::{Cli, Command};
+use avscan_orchestrator::client;
 use avscan_orchestrator::config::Config;
 use avscan_orchestrator::supervisor::{load_specs, Orchestrator, RunOptions};
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
+    if !matches!(cli.command, Command::Validate | Command::Serve { .. }) {
+        return client::run(&cli.command).await;
+    }
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
     tracing_subscriber::fmt()
         .json()
@@ -25,11 +30,11 @@ async fn main() -> Result<()> {
     let config = Config::from_file(&cli.config)?;
     let specs = load_specs(&config)?;
     let listen = match cli.command {
-        Command::Validate => {
+        Command::Serve { listen } => listen.unwrap_or(config.listen_addr()?),
+        _ => {
             info!(modules = specs.len(), "configuration validated");
             return Ok(());
         }
-        Command::Serve { listen } => listen.unwrap_or(config.listen_addr()?),
     };
     if !listen.ip().is_loopback() {
         bail!("HTTP API must bind a loopback address");

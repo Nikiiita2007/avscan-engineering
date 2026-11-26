@@ -1,6 +1,6 @@
 # Protocol: command and command_result
 
-Status: added in stage 6.2. The C++ host does not send or accept these messages yet; mirror them in `libs/host` before relying on them across both hosts.
+Status: stage 6.2 (protocol, HTTP) and 6.3 (CLI client). The C++ host does not send or accept these messages yet; mirror them in `libs/host` before relying on them across both hosts.
 
 ## command (host to module)
 - `type`: `command`, `id`: request id (`cmd-N`, at most 64 chars), `module`: module id.
@@ -23,12 +23,21 @@ Status: added in stage 6.2. The C++ host does not send or accept these messages 
 - `POST /modules/{id}/stop`: 202, does not wait for exit; 404; 409 not running.
 - `POST /modules/{id}/command` with `{"name":"...","args":{}}`: 200 with `{ok,error}` when the module answers; 404; 409; 429; 502 if the module ended; 504 after 30 s.
 
-Example:
+## CLI client
+The client commands talk to a running `serve` over loopback (`--api`, env `AVSCAN_API`, default `127.0.0.1:8787`). They print the JSON response and exit with a non-zero code on a non-2xx status.
 ```sh
-curl -X POST http://127.0.0.1:8787/modules/log_hunter/command -H 'content-type: application/json' -d '{"name":"log.hunt","args":{"path":"/var/log/auth.log"}}'
+orchestrator modules
+orchestrator stop log_hunter
+orchestrator start log_hunter
+orchestrator exec log_hunter log.hunt --args '{"paths":["/var/log/auth.log"]}'
 ```
 
+## Modules
+- `log_hunter` answers `log.hunt` (args: `paths`). Files are analyzed on the protocol thread, so a large file delays `ping` answers.
+- `net-analyzer` and `vuln-scanner` do not handle `command` yet.
+- Security: the API has no authentication and `paths` is not restricted, so any local process can make the module read any file the module can read.
+
 ## Not done yet
-- CLI subcommands for start/stop/command (HTTP only for now).
-- Integration tests with a real module binary.
-- Updating `libs/host` (C++) and the message list in `avscan-protocol` docs.
+- Updating `libs/host` (C++) and the message list in the `avscan-protocol` docs.
+- `command` support in `net-analyzer` and `vuln-scanner`.
+- Path allow-list or authentication for the API.
