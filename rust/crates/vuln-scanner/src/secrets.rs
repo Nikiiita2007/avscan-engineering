@@ -219,7 +219,10 @@ mod tests {
     fn detects_env_style_and_json_style_names() {
         assert_eq!(rules_of("DB_PASSWORD=Zx9fQ2mLp7Vb"), ["generic-credential"]);
         assert_eq!(rules_of("AWS_SECRET=Zx9fQ2mLp7Vb"), ["generic-credential"]);
-        assert_eq!(rules_of("export API_TOKEN='Qw3rT7yU1oPz'"), ["generic-credential"]);
+        assert_eq!(
+            rules_of("export API_TOKEN='Qw3rT7yU1oPz'"),
+            ["generic-credential"]
+        );
         let json_line = "\"api_key\": \"Qw3rT7yU1oPz\"";
         assert_eq!(rules_of(json_line), ["generic-credential"]);
     }
