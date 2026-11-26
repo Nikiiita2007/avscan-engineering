@@ -9,9 +9,10 @@ use crate::report::{Finding, Kind, Severity};
 
 const MAX_LINE_LEN: usize = 4000;
 const MIN_ENTROPY: f64 = 3.0;
+/// Secret-like names (also as suffix, e.g. `DB_PASSWORD` or `"api_key"`) assigned a value.
 const GENERIC_PATTERN: &str = concat!(
-    r"(?i)\b(?:password|passwd|secret|api[_-]?key|access[_-]?key|",
-    r"auth[_-]?token|token)\b\s*[:=]\s*[\x22']?([^\s\x22',;]{8,})"
+    r"(?i)(?:password|passwd|secret|api[_-]?key|access[_-]?key|",
+    r"auth[_-]?token|token)[\x22']?\s*[:=]\s*[\x22']?([^\s\x22',;]{8,})"
 );
 
 struct RuleSpec {
@@ -215,8 +216,18 @@ mod tests {
     }
 
     #[test]
+    fn detects_env_style_and_json_style_names() {
+        assert_eq!(rules_of("DB_PASSWORD=Zx9fQ2mLp7Vb"), ["generic-credential"]);
+        assert_eq!(rules_of("AWS_SECRET=Zx9fQ2mLp7Vb"), ["generic-credential"]);
+        assert_eq!(rules_of("export API_TOKEN='Qw3rT7yU1oPz'"), ["generic-credential"]);
+        let json_line = "\"api_key\": \"Qw3rT7yU1oPz\"";
+        assert_eq!(rules_of(json_line), ["generic-credential"]);
+    }
+
+    #[test]
     fn ignores_placeholders_and_low_entropy() {
         assert!(rules_of("password = ${DB_PASSWORD}").is_empty());
+        assert!(rules_of("DB_PASSWORD=${DB_PASSWORD}").is_empty());
         assert!(rules_of("token = changeme-please").is_empty());
         assert!(rules_of("secret = your_secret_here").is_empty());
         assert!(rules_of("password = aaaaaaaaaaaa").is_empty());

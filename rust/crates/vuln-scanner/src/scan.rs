@@ -105,10 +105,7 @@ fn visit(path: &Path, depth: usize, options: &ScanOptions, report: &mut Report) 
         report.skipped_files += 1;
         return;
     };
-    let mut children: Vec<PathBuf> = entries
-        .filter_map(Result::ok)
-        .map(|e| e.path())
-        .collect();
+    let mut children: Vec<PathBuf> = entries.filter_map(Result::ok).map(|e| e.path()).collect();
     children.sort();
     for child in children {
         let name = child.file_name().and_then(|n| n.to_str()).unwrap_or("");
@@ -169,7 +166,10 @@ mod tests {
         let report = scan_paths(&[dir.path().to_path_buf()], &ScanOptions::default());
         assert_eq!(report.scanned_files, 2);
         assert_eq!(report.findings.len(), 2);
-        assert!(report.findings.iter().all(|f| f.rule == "generic-credential"));
+        assert!(report
+            .findings
+            .iter()
+            .all(|f| f.rule == "generic-credential"));
     }
 
     #[test]
@@ -215,8 +215,14 @@ mod tests {
     #[test]
     fn classifies_file_names() {
         assert!(matches!(classify("Dockerfile"), Some(FileKind::Dockerfile)));
-        assert!(matches!(classify("app.dockerfile"), Some(FileKind::Dockerfile)));
-        assert!(matches!(classify("requirements-dev.txt"), Some(FileKind::Requirements)));
+        assert!(matches!(
+            classify("app.dockerfile"),
+            Some(FileKind::Dockerfile)
+        ));
+        assert!(matches!(
+            classify("requirements-dev.txt"),
+            Some(FileKind::Requirements)
+        ));
         assert!(matches!(classify(".env.local"), Some(FileKind::Config)));
         assert!(classify("main.rs").is_none());
     }

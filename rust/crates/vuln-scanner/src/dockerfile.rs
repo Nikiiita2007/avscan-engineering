@@ -48,13 +48,19 @@ fn eol_reason(name: &str, tag: &str) -> Option<&'static str> {
         return (old_name || old_major).then_some("Debian release is end-of-life");
     }
     if short == "centos" {
-        return major.is_some_and(|m| m <= 8).then_some("CentOS release is end-of-life");
+        return major
+            .is_some_and(|m| m <= 8)
+            .then_some("CentOS release is end-of-life");
     }
     if short == "python" {
-        return major.is_some_and(|m| m == 2).then_some("Python 2 is end-of-life");
+        return major
+            .is_some_and(|m| m == 2)
+            .then_some("Python 2 is end-of-life");
     }
     if short == "node" {
-        return major.is_some_and(|m| m <= 16).then_some("Node.js release is end-of-life");
+        return major
+            .is_some_and(|m| m <= 16)
+            .then_some("Node.js release is end-of-life");
     }
     None
 }
@@ -64,7 +70,9 @@ fn split_instruction(line: &str) -> Option<(String, &str)> {
     if trimmed.is_empty() || trimmed.starts_with('#') {
         return None;
     }
-    let (word, rest) = trimmed.split_once(char::is_whitespace).unwrap_or((trimmed, ""));
+    let (word, rest) = trimmed
+        .split_once(char::is_whitespace)
+        .unwrap_or((trimmed, ""));
     Some((word.to_ascii_uppercase(), rest.trim()))
 }
 
@@ -193,7 +201,10 @@ mod tests {
     use super::*;
 
     fn rules_of(text: &str) -> Vec<String> {
-        analyze(text, "Dockerfile").into_iter().map(|f| f.rule).collect()
+        analyze(text, "Dockerfile")
+            .into_iter()
+            .map(|f| f.rule)
+            .collect()
     }
 
     fn has(text: &str, rule: &str) -> bool {
@@ -202,9 +213,15 @@ mod tests {
 
     #[test]
     fn flags_latest_and_untagged_images() {
-        assert!(has("FROM ubuntu:latest\nUSER app\n", "docker-unpinned-image"));
+        assert!(has(
+            "FROM ubuntu:latest\nUSER app\n",
+            "docker-unpinned-image"
+        ));
         assert!(has("FROM python\nUSER app\n", "docker-unpinned-image"));
-        assert!(!has("FROM python:3.12\nUSER app\n", "docker-unpinned-image"));
+        assert!(!has(
+            "FROM python:3.12\nUSER app\n",
+            "docker-unpinned-image"
+        ));
     }
 
     #[test]
@@ -212,7 +229,10 @@ mod tests {
         assert!(has("FROM ubuntu:16.04\nUSER app\n", "docker-eol-image"));
         assert!(has("FROM node:16-alpine\nUSER node\n", "docker-eol-image"));
         assert!(has("FROM python:2.7\nUSER app\n", "docker-eol-image"));
-        assert!(has("FROM debian:buster-slim\nUSER app\n", "docker-eol-image"));
+        assert!(has(
+            "FROM debian:buster-slim\nUSER app\n",
+            "docker-eol-image"
+        ));
         assert!(!has("FROM node:22-alpine\nUSER node\n", "docker-eol-image"));
     }
 
@@ -229,7 +249,10 @@ mod tests {
     fn root_user_checks_only_the_final_stage() {
         assert!(has("FROM alpine:3.20\n", "docker-runs-as-root"));
         assert!(has("FROM alpine:3.20\nUSER root\n", "docker-runs-as-root"));
-        assert!(!has("FROM alpine:3.20\nUSER app:app\n", "docker-runs-as-root"));
+        assert!(!has(
+            "FROM alpine:3.20\nUSER app:app\n",
+            "docker-runs-as-root"
+        ));
         let multi = "FROM alpine:3.20 AS a\nUSER app\nFROM alpine:3.20\n";
         assert!(has(multi, "docker-runs-as-root"));
     }
@@ -238,10 +261,16 @@ mod tests {
     fn flags_risky_run_and_add() {
         let text = "FROM alpine:3.20\nUSER app\nRUN curl -sSL https://x.example/i.sh | sh\n";
         assert!(has(text, "docker-pipe-to-shell"));
-        assert!(has("FROM alpine:3.20\nUSER a\nRUN chmod -R 777 /app\n", "docker-chmod-777"));
+        assert!(has(
+            "FROM alpine:3.20\nUSER a\nRUN chmod -R 777 /app\n",
+            "docker-chmod-777"
+        ));
         let add = "FROM alpine:3.20\nUSER a\nADD https://x.example/f.tgz /f\n";
         assert!(has(add, "docker-add-remote-url"));
-        assert!(!has("FROM alpine:3.20\nUSER a\nADD app.tgz /app\n", "docker-add-remote-url"));
+        assert!(!has(
+            "FROM alpine:3.20\nUSER a\nADD app.tgz /app\n",
+            "docker-add-remote-url"
+        ));
     }
 
     #[test]

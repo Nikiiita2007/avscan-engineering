@@ -213,7 +213,11 @@ mod tests {
     #[test]
     fn every_advisory_has_a_parsable_fixed_version() {
         for advisory in &ADVISORIES {
-            assert!(parse_version(advisory.fixed_in).is_some(), "{}", advisory.id);
+            assert!(
+                parse_version(advisory.fixed_in).is_some(),
+                "{}",
+                advisory.id
+            );
         }
     }
 }

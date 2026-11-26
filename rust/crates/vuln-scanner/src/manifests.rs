@@ -130,7 +130,10 @@ mod tests {
         let text = "{\n  \"dependencies\": {\n    \"lodash\": \"^4.17.20\",\n    \"left-pad\": \"1.0.0\"\n  },\n  \"devDependencies\": {\"minimist\": \"1.2.5\"}\n}";
         let findings = analyze_package_json(text, "package.json");
         assert_eq!(findings.len(), 2);
-        let lodash = findings.iter().find(|f| f.rule == "CVE-2021-23337").unwrap();
+        let lodash = findings
+            .iter()
+            .find(|f| f.rule == "CVE-2021-23337")
+            .unwrap();
         assert_eq!(lodash.line, 3);
         assert!(lodash.message.contains("fixed in 4.17.21"));
         assert!(findings.iter().any(|f| f.rule == "CVE-2021-44906"));

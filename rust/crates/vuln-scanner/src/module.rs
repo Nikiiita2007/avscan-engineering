@@ -119,7 +119,10 @@ impl<R: Read, W: Write> Channel<R, W> {
 
 fn report_event(report: &crate::report::Report) -> Result<Message, ModuleError> {
     let data = serde_json::to_value(report)?;
-    Ok(reply("event", json!({ "topic": REPORT_TOPIC, "data": data })))
+    Ok(reply(
+        "event",
+        json!({ "topic": REPORT_TOPIC, "data": data }),
+    ))
 }
 
 fn publish_scan<R: Read, W: Write>(
@@ -167,7 +170,9 @@ pub fn run<R: Read, W: Write>(input: R, output: W) -> Result<(), ModuleError> {
     };
     let host_api = hello.payload.get("host_api").and_then(Value::as_i64);
     if hello.msg_type != "hello" || host_api != Some(HOST_API) {
-        return Err(ModuleError::Handshake("expected hello with host_api 1".to_string()));
+        return Err(ModuleError::Handshake(
+            "expected hello with host_api 1".to_string(),
+        ));
     }
     let ack = json!({
         "api_version": HOST_API,
@@ -259,7 +264,9 @@ mod tests {
         let types: Vec<&str> = replies.iter().map(|m| m.msg_type.as_str()).collect();
         assert_eq!(types, ["hello_ack", "started", "pong", "stopped"]);
         assert_eq!(replies[2].id.as_deref(), Some("ping-1"));
-        assert!(replies.iter().all(|m| m.module.as_deref() == Some(MODULE_ID)));
+        assert!(replies
+            .iter()
+            .all(|m| m.module.as_deref() == Some(MODULE_ID)));
     }
 
     #[test]
@@ -274,7 +281,10 @@ mod tests {
         assert!(manifest.publishes.iter().any(|t| t == REPORT_TOPIC));
         assert!(manifest.subscribes.iter().any(|t| t == SCAN_TOPIC));
         let replies = run_session(handshake(json!({}))).unwrap();
-        assert_eq!(replies[0].payload["module_version"], manifest.version.as_str());
+        assert_eq!(
+            replies[0].payload["module_version"],
+            manifest.version.as_str()
+        );
         assert_eq!(replies[0].payload["api_version"], manifest.api_version);
     }
 
@@ -333,7 +343,10 @@ mod tests {
         let bad = vec![host_msg("hello", json!({ "host_api": 2 }))];
         assert!(matches!(run_session(bad), Err(ModuleError::Handshake(_))));
         let wrong_type = vec![host_msg("start", json!({}))];
-        assert!(matches!(run_session(wrong_type), Err(ModuleError::Handshake(_))));
+        assert!(matches!(
+            run_session(wrong_type),
+            Err(ModuleError::Handshake(_))
+        ));
     }
 
     #[test]
@@ -345,7 +358,8 @@ mod tests {
 
     #[test]
     fn config_keys_override_defaults() {
-        let value = json!({ "max_depth": 2, "max_file_kb": 4, "max_findings": 7, "paths": ["a", 1] });
+        let value =
+            json!({ "max_depth": 2, "max_file_kb": 4, "max_findings": 7, "paths": ["a", 1] });
         let config = ModuleConfig::from_value(&value);
         assert_eq!(config.options.max_depth, 2);
         assert_eq!(config.options.max_file_bytes, 4096);
