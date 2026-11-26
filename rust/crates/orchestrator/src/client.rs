@@ -164,9 +164,7 @@ mod tests {
     #[tokio::test]
     async fn talks_to_a_real_api_server() {
         let addr = serve_empty(None).await;
-        let (status, body) = request(addr, "GET", "/health", None, None)
-            .await
-            .unwrap();
+        let (status, body) = request(addr, "GET", "/health", None, None).await.unwrap();
         assert_eq!(status, 200);
         assert!(body.contains("ok"));
         let (status, _) = request(addr, "POST", "/modules/missing/stop", None, None)
@@ -179,9 +177,7 @@ mod tests {
     async fn token_is_sent_and_enforced() {
         let token = "0123456789abcdef";
         let addr = serve_empty(Some(token)).await;
-        let (denied, _) = request(addr, "GET", "/modules", None, None)
-            .await
-            .unwrap();
+        let (denied, _) = request(addr, "GET", "/modules", None, None).await.unwrap();
         assert_eq!(denied, 401);
         let (wrong, _) = request(addr, "GET", "/modules", None, Some("wrong-token"))
             .await

@@ -87,11 +87,7 @@ fn same_token(given: &[u8], expected: &[u8]) -> bool {
     diff == 0
 }
 
-async fn require_token(
-    State(token): State<Arc<String>>,
-    request: Request,
-    next: Next,
-) -> Response {
+async fn require_token(State(token): State<Arc<String>>, request: Request, next: Next) -> Response {
     if request.uri().path() == "/health" {
         return next.run(request).await;
     }
@@ -327,10 +323,7 @@ mod tests {
             StatusCode::UNAUTHORIZED
         );
         let good = get_request("/modules", Some(good_auth.as_str()));
-        assert_eq!(
-            status_of(app_with_token(token), good).await,
-            StatusCode::OK
-        );
+        assert_eq!(status_of(app_with_token(token), good).await, StatusCode::OK);
         let events = get_request("/events", None);
         assert_eq!(
             status_of(app_with_token(token), events).await,

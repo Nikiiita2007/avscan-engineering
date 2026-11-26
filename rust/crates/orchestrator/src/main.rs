@@ -42,7 +42,11 @@ async fn main() -> Result<()> {
     if !listen.ip().is_loopback() {
         bail!("HTTP API must bind a loopback address");
     }
-    if cli.token.as_deref().is_some_and(|t| t.len() < MIN_TOKEN_LEN) {
+    if cli
+        .token
+        .as_deref()
+        .is_some_and(|t| t.len() < MIN_TOKEN_LEN)
+    {
         bail!("the API token must be at least {MIN_TOKEN_LEN} characters");
     }
     let listener = tokio::net::TcpListener::bind(listen).await?;
