@@ -86,7 +86,13 @@ mod tests {
 
     #[test]
     fn parses_stop_with_api_address() {
-        let args = ["orchestrator", "stop", "log_hunter", "--api", "127.0.0.1:9000"];
+        let args = [
+            "orchestrator",
+            "stop",
+            "log_hunter",
+            "--api",
+            "127.0.0.1:9000",
+        ];
         let cli = Cli::try_parse_from(args).unwrap();
         match cli.command {
             Command::Stop { id, api } => {
@@ -102,7 +108,9 @@ mod tests {
         let args = ["orchestrator", "exec", "log_hunter", "log.hunt"];
         let cli = Cli::try_parse_from(args).unwrap();
         match cli.command {
-            Command::Exec { name, args, api, .. } => {
+            Command::Exec {
+                name, args, api, ..
+            } => {
                 assert_eq!(name, "log.hunt");
                 assert_eq!(args, "{}");
                 assert_eq!(api.addr.port(), 8787);
