@@ -571,7 +571,10 @@ mod tests {
 
     #[test]
     fn command_roots_default_to_the_directories_of_the_paths() {
-        let paths = [PathBuf::from("/var/log/auth.log"), PathBuf::from("local.log")];
+        let paths = [
+            PathBuf::from("/var/log/auth.log"),
+            PathBuf::from("local.log"),
+        ];
         let roots = command_roots_from(None, &paths);
         assert_eq!(roots, [PathBuf::from("/var/log")]);
         let explicit = json!(["/srv/logs"]);
