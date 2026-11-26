@@ -1,6 +1,6 @@
 # Protocol: command and command_result
 
-Status: stage 6.2 (protocol, HTTP), 6.3 (CLI client), 6.4 (path restriction), 6.5 (API token), 6.6 (`vuln_scanner`), 6.7 (`net_analyzer`) and 6.8 (C++ host). Both the Rust orchestrator and the C++ `ModuleHost` can now send `command` and receive `command_result`.
+Status: stage 6.2 (protocol, HTTP), 6.3 (CLI client), 6.4 (path restriction), 6.5 (API token), 6.6 (`vuln_scanner`), 6.7 (`net_analyzer`), 6.8 (C++ host) and 6.9 (events to modules). Both the Rust orchestrator and the C++ `ModuleHost` can send `command` and receive `command_result`.
 
 ## command (host to module)
 - `type`: `command`, `id`: request id (`cmd-N`, at most 64 chars), `module`: module id.
@@ -18,6 +18,15 @@ Status: stage 6.2 (protocol, HTTP), 6.3 (CLI client), 6.4 (path restriction), 6.
 - At most 16 commands wait in the per-module queue; more give HTTP 429.
 - Pending commands are completed with a failure if the session ends (the HTTP requester gets 502).
 
+## Events to modules
+- The Rust orchestrator sends a bus event to a module as an `event` message (payload `topic`, `data`, `source`) when the topic matches the manifest `subscribes` list. A module never receives its own events. The session subscribes when it is created, so events published during the handshake are delivered after the start. A module that reads too slowly loses events (logged).
+- The host publishes events with `POST /events` (body `{"topic":"...","data":{...}}`, `data` optional and an object). Topics use lowercase letters, digits, `_` and `.` (at most 64 chars, no empty segments). The answer is 202 with the number of bus receivers; it does not mean that a module got the event. Events from the host have the source `host`.
+- `vuln_scanner` reacts to `vuln_scanner.scan` (data `paths`) like to the command, but only inside `command_roots`; a refused request is reported as a `log` message because an event has no answer.
+```sh
+curl -X POST http://127.0.0.1:8787/events -H "Authorization: Bearer $AVSCAN_TOKEN" -H 'content-type: application/json' -d '{"topic":"vuln_scanner.scan","data":{"paths":["/srv/project"]}}'
+```
+- The C++ `ModuleHost` already forwards bus events to subscribed modules; the Rust side now matches it.
+
 ## C++ host
 `ModuleHost::sendCommand(name, args, callback)` in `libs/host/module_host.hpp`:
 - The callback runs once with a `CommandOutcome { ok, error }`: the module's `command_result`, or a failure when the command is rejected (module not running, undeclared capability, 16 commands already waiting), the module fails or the host stops. It does not run if the host object is destroyed first, and it must not call back into the host.
@@ -28,6 +37,7 @@ Status: stage 6.2 (protocol, HTTP), 6.3 (CLI client), 6.4 (path restriction), 6.
 - `POST /modules/{id}/start`: 202; 404 unknown module; 409 already running or still stopping.
 - `POST /modules/{id}/stop`: 202, does not wait for exit; 404; 409 not running.
 - `POST /modules/{id}/command` with `{"name":"...","args":{}}`: 200 with `{ok,error}` when the module answers; 404; 409; 429; 502 if the module ended; 504 after 30 s.
+- `POST /events`: 202; 400 for an invalid topic or non-object data.
 
 ## Authentication
 - Start the server with a token: `AVSCAN_TOKEN=<at least 16 characters> orchestrator serve` (or `--token`). Every route except `GET /health` then needs `Authorization: Bearer <token>`; otherwise the server answers 401.
@@ -41,7 +51,7 @@ curl -H "Authorization: Bearer $AVSCAN_TOKEN" http://127.0.0.1:8787/modules
 ```
 
 ## CLI client
-The client commands talk to a running `serve` over loopback (`--api`, env `AVSCAN_API`, default `127.0.0.1:8787`). They print the JSON response and exit with a non-zero code on a non-2xx status.
+The client commands talk to a running `serve` over loopback (`--api`, env `AVSCAN_API`, default `127.0.0.1:8787`). They print the JSON response and exit with a non-zero code on a non-2xx status. There is no CLI subcommand for `POST /events` yet; use curl.
 ```sh
 orchestrator modules
 orchestrator stop log_hunter
@@ -63,5 +73,5 @@ orchestrator exec net_analyzer net.analyze --args '{"pcap_paths":["/srv/pcap/cap
 - The `net_analyzer` manifest is still a draft in `modules/net_analyzer/module.json` (needs the `admin` permission); the Rust crate does not modify it.
 
 ## Not done yet
-- The message type list in the comment of `libs/host/protocol.hpp` and in `docs/MODULES.md` does not mention `command` and `command_result` yet.
+- The message type list in the comment of `libs/host/protocol.hpp` and in the protocol specification does not mention `command` and `command_result` yet.
 - The C++ host has no HTTP or CLI front end; `sendCommand` is a library call only.

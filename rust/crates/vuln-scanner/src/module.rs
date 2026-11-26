@@ -7,10 +7,12 @@
 //! Only protocol frames may be written to the output; diagnostics go to stderr.
 //!
 //! Command `vuln.scan_files` (args: `paths`) scans the paths, publishes the
-//! report as `vuln_scanner.report` and answers `command_result`. Every path is
+//! report as `vuln_scanner.report` and answers `command_result`. The event
+//! `vuln_scanner.scan` (data: `paths`) does the same without an answer; a
+//! refused request is reported as a `log` message. In both cases every path is
 //! resolved (symlinks included) and must lie inside one of the `command_roots`.
 //! Without `command_roots` the configured `paths` are the roots; with neither,
-//! the command is refused. Scans run on the protocol thread, so a large tree
+//! the request is refused. Scans run on the protocol thread, so a large tree
 //! delays `ping` answers until it is done.
 
 use std::io::{Read, Write};
@@ -46,7 +48,7 @@ pub enum ModuleError {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ModuleConfig {
     pub paths: Vec<PathBuf>,
-    /// Directories or files the `vuln.scan_files` command may read.
+    /// Directories or files that commands and scan events may read.
     pub command_roots: Vec<PathBuf>,
     pub options: ScanOptions,
 }
@@ -166,34 +168,6 @@ fn publish_scan<R: Read, W: Write>(
     }
 }
 
-fn handle_event<R: Read, W: Write>(
-    ch: &mut Channel<R, W>,
-    msg: &Message,
-    options: &ScanOptions,
-) -> Result<(), ModuleError> {
-    let topic = msg.payload.get("topic").and_then(Value::as_str);
-    if topic != Some(SCAN_TOPIC) {
-        return Ok(());
-    }
-    let data = msg.payload.get("data");
-    let paths = paths_from(data.and_then(|d| d.get("paths")));
-    if paths.is_empty() {
-        let note = json!({ "message": "scan request without paths ignored" });
-        return ch.send(&reply("log", note));
-    }
-    publish_scan(ch, &paths, options)
-}
-
-fn command_result(request: &Message, ok: bool, error: Option<&str>) -> Message {
-    let mut payload = json!({ "ok": ok });
-    if let Some(text) = error {
-        payload["error"] = json!(text);
-    }
-    let mut result = reply("command_result", payload);
-    result.id = request.id.clone();
-    result
-}
-
 /// Resolves every path (following symlinks) and requires it to lie inside one
 /// of the roots. Returns the resolved paths or a message for the requester.
 fn check_paths(paths: &[PathBuf], roots: &[PathBuf]) -> Result<Vec<PathBuf>, String> {
@@ -214,6 +188,43 @@ fn check_paths(paths: &[PathBuf], roots: &[PathBuf]) -> Result<Vec<PathBuf>, Str
         checked.push(real);
     }
     Ok(checked)
+}
+
+/// Handles a bus event. Only `vuln_scanner.scan` is acted on; a refused
+/// request is reported as a `log` message because events have no answer.
+fn handle_event<R: Read, W: Write>(
+    ch: &mut Channel<R, W>,
+    msg: &Message,
+    config: &ModuleConfig,
+) -> Result<(), ModuleError> {
+    let topic = msg.payload.get("topic").and_then(Value::as_str);
+    if topic != Some(SCAN_TOPIC) {
+        return Ok(());
+    }
+    let data = msg.payload.get("data");
+    let requested = paths_from(data.and_then(|d| d.get("paths")));
+    if requested.is_empty() {
+        let note = json!({ "message": "scan request without paths ignored" });
+        return ch.send(&reply("log", note));
+    }
+    let paths = match check_paths(&requested, &config.command_roots) {
+        Ok(paths) => paths,
+        Err(text) => {
+            let note = json!({ "message": format!("scan request refused: {text}") });
+            return ch.send(&reply("log", note));
+        }
+    };
+    publish_scan(ch, &paths, &config.options)
+}
+
+fn command_result(request: &Message, ok: bool, error: Option<&str>) -> Message {
+    let mut payload = json!({ "ok": ok });
+    if let Some(text) = error {
+        payload["error"] = json!(text);
+    }
+    let mut result = reply("command_result", payload);
+    result.id = request.id.clone();
+    result
 }
 
 /// Answers one `command`. Unknown commands and bad arguments are reported in
@@ -292,7 +303,7 @@ pub fn run<R: Read, W: Write>(input: R, output: W) -> Result<(), ModuleError> {
                 ch.send(&reply("stopped", json!({})))?;
                 return Ok(());
             }
-            "event" => handle_event(&mut ch, &msg, &config.options)?,
+            "event" => handle_event(&mut ch, &msg, &config)?,
             "command" => handle_command(&mut ch, &msg, &config)?,
             _ => {}
         }
@@ -357,14 +368,26 @@ mod tests {
         run_session(messages).unwrap()
     }
 
+    /// Handshake with `config`, one `vuln_scanner.scan` event and stop.
+    fn event_session(config: Value, paths: Value) -> Vec<Message> {
+        let mut messages = handshake(config);
+        let trigger = json!({ "topic": SCAN_TOPIC, "data": { "paths": paths } });
+        messages.push(host_msg("event", trigger));
+        messages.push(host_msg("stop", json!({})));
+        run_session(messages).unwrap()
+    }
+
+    fn types(replies: &[Message]) -> Vec<&str> {
+        replies.iter().map(|m| m.msg_type.as_str()).collect()
+    }
+
     #[test]
     fn handshake_ping_and_stop() {
         let mut messages = handshake(json!({}));
         messages.push(host_msg("ping", json!({})).with_id("ping-1"));
         messages.push(host_msg("stop", json!({})));
         let replies = run_session(messages).unwrap();
-        let types: Vec<&str> = replies.iter().map(|m| m.msg_type.as_str()).collect();
-        assert_eq!(types, ["hello_ack", "started", "pong", "stopped"]);
+        assert_eq!(types(&replies), ["hello_ack", "started", "pong", "stopped"]);
         assert_eq!(replies[2].id.as_deref(), Some("ping-1"));
         assert!(replies
             .iter()
@@ -406,16 +429,36 @@ mod tests {
     fn scan_event_triggers_a_report() {
         let dir = TempDir::new("module_event");
         dir.write("Dockerfile", "FROM ubuntu:16.04\nUSER app\n");
-        let paths = json!([dir.path().to_str().unwrap()]);
-        let trigger = json!({ "topic": SCAN_TOPIC, "data": { "paths": paths } });
-        let mut messages = handshake(json!({}));
-        messages.push(host_msg("event", trigger));
-        messages.push(host_msg("stop", json!({})));
-        let replies = run_session(messages).unwrap();
+        let root = dir.path().to_str().unwrap().to_string();
+        let config = json!({ "command_roots": [root] });
+        let replies = event_session(config, json!([dir.path().to_str().unwrap()]));
         let report = &replies[2].payload["data"];
         assert_eq!(report["findings"][0]["rule"], "docker-eol-image");
         assert_eq!(report["findings"][0]["severity"], "high");
         assert_eq!(replies[3].msg_type, "stopped");
+    }
+
+    #[test]
+    fn scan_event_outside_the_roots_is_refused() {
+        let allowed = TempDir::new("module_event_allowed");
+        let other = TempDir::new("module_event_other");
+        other.write("Dockerfile", "FROM ubuntu:16.04\n");
+        let root = allowed.path().to_str().unwrap().to_string();
+        let config = json!({ "command_roots": [root] });
+        let replies = event_session(config, json!([other.path().to_str().unwrap()]));
+        assert_eq!(types(&replies), ["hello_ack", "started", "log", "stopped"]);
+        let note = replies[2].payload["message"].as_str().unwrap();
+        assert!(note.contains("refused") && note.contains("outside command_roots"));
+    }
+
+    #[test]
+    fn scan_event_needs_configured_roots() {
+        let dir = TempDir::new("module_event_no_roots");
+        dir.write("Dockerfile", "FROM ubuntu:16.04\n");
+        let replies = event_session(json!({}), json!([dir.path().to_str().unwrap()]));
+        assert_eq!(types(&replies), ["hello_ack", "started", "log", "stopped"]);
+        let note = replies[2].payload["message"].as_str().unwrap();
+        assert!(note.contains("command_roots"));
     }
 
     #[test]
@@ -425,9 +468,8 @@ mod tests {
         let root = dir.path().to_str().unwrap().to_string();
         let config = json!({ "command_roots": [root] });
         let replies = scan_session(config, json!([dir.path().to_str().unwrap()]));
-        let types: Vec<&str> = replies.iter().map(|m| m.msg_type.as_str()).collect();
         assert_eq!(
-            types,
+            types(&replies),
             ["hello_ack", "started", "event", "command_result", "stopped"]
         );
         assert_eq!(replies[2].payload["topic"], REPORT_TOPIC);
@@ -445,8 +487,10 @@ mod tests {
         let root = allowed.path().to_str().unwrap().to_string();
         let config = json!({ "command_roots": [root] });
         let replies = scan_session(config, json!([other.path().to_str().unwrap()]));
-        let types: Vec<&str> = replies.iter().map(|m| m.msg_type.as_str()).collect();
-        assert_eq!(types, ["hello_ack", "started", "command_result", "stopped"]);
+        assert_eq!(
+            types(&replies),
+            ["hello_ack", "started", "command_result", "stopped"]
+        );
         assert_eq!(replies[2].payload["ok"], json!(false));
         let error = replies[2].payload["error"].as_str().unwrap();
         assert!(error.contains("outside command_roots"));
@@ -470,9 +514,8 @@ mod tests {
         messages.push(command_msg("cmd-2", SCAN_COMMAND, json!({})));
         messages.push(host_msg("stop", json!({})));
         let replies = run_session(messages).unwrap();
-        let types: Vec<&str> = replies.iter().map(|m| m.msg_type.as_str()).collect();
         assert_eq!(
-            types,
+            types(&replies),
             [
                 "hello_ack",
                 "started",

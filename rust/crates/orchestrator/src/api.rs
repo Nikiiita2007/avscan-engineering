@@ -3,8 +3,10 @@
 //! The API deliberately permits only loopback binds. Control routes:
 //! `POST /modules/{id}/start`, `POST /modules/{id}/stop` and
 //! `POST /modules/{id}/command` (body: `name`, optional `args`). The command
-//! `name` must be a capability declared by the module. SSE has no replay;
-//! lag is reported explicitly.
+//! `name` must be a capability declared by the module. `POST /events`
+//! (body: `topic`, optional object `data`) publishes an event from the host;
+//! modules whose manifest subscribes to the topic receive it. SSE has no
+//! replay; lag is reported explicitly.
 //!
 //! With a token every route except `GET /health` requires the header
 //! `Authorization: Bearer <token>`; without one the API is open to every local
@@ -34,6 +36,8 @@ pub type Shared = Arc<Mutex<Orchestrator>>;
 
 /// How long a command request waits for the module's answer.
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
+/// Longest accepted topic name of a published event.
+const MAX_TOPIC_LEN: usize = 64;
 
 type ApiError = (StatusCode, Json<Value>);
 
@@ -50,6 +54,13 @@ struct CommandRequest {
     name: String,
     #[serde(default)]
     args: Map<String, Value>,
+}
+
+#[derive(Debug, Deserialize)]
+struct PublishRequest {
+    topic: String,
+    #[serde(default)]
+    data: Value,
 }
 
 fn status(id: String, value: ModuleStatus) -> Status {
@@ -75,6 +86,17 @@ fn fail(error: ControlError) -> ApiError {
         ControlError::QueueFull => StatusCode::TOO_MANY_REQUESTS,
     };
     (code, Json(json!({"error": error.to_string()})))
+}
+
+fn bad_request(text: &str) -> ApiError {
+    (StatusCode::BAD_REQUEST, Json(json!({"error": text})))
+}
+
+/// Lowercase letters, digits, `_` and `.`; no empty segments.
+fn valid_topic(topic: &str) -> bool {
+    let allowed = |c: char| c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '_' | '.');
+    let shaped = !topic.starts_with('.') && !topic.ends_with('.') && !topic.contains("..");
+    (1..=MAX_TOPIC_LEN).contains(&topic.len()) && shaped && topic.chars().all(allowed)
 }
 
 /// Compares in time that depends only on the length of the expected token.
@@ -158,6 +180,27 @@ async fn command(
     }
 }
 
+/// Publishes an event from the host. The answer only says how many bus
+/// receivers existed; modules decide by their `subscribes` list.
+async fn publish(
+    State(shared): State<Shared>,
+    Json(request): Json<PublishRequest>,
+) -> Result<(StatusCode, Json<Value>), ApiError> {
+    if !valid_topic(&request.topic) {
+        return Err(bad_request("invalid topic"));
+    }
+    let data = match request.data {
+        Value::Null => json!({}),
+        data @ Value::Object(_) => data,
+        _ => return Err(bad_request("data must be a JSON object")),
+    };
+    let receivers = shared.lock().await.publish(&request.topic, data);
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(json!({"topic": request.topic, "receivers": receivers})),
+    ))
+}
+
 async fn events(
     State(shared): State<Shared>,
 ) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
@@ -199,7 +242,7 @@ pub fn router_with_token(shared: Shared, token: Option<String>) -> Router {
         .route("/modules/{id}/start", post(start))
         .route("/modules/{id}/stop", post(stop))
         .route("/modules/{id}/command", post(command))
-        .route("/events", get(events))
+        .route("/events", get(events).post(publish))
         .with_state(shared);
     match token {
         Some(token) => {
@@ -235,6 +278,17 @@ mod tests {
             builder = builder.header("authorization", value);
         }
         builder.body(Body::empty()).unwrap()
+    }
+
+    fn publish_request(body: &str, auth: Option<&str>) -> Request<Body> {
+        let mut builder = Request::builder()
+            .method("POST")
+            .uri("/events")
+            .header("content-type", "application/json");
+        if let Some(value) = auth {
+            builder = builder.header("authorization", value);
+        }
+        builder.body(Body::from(body.to_string())).unwrap()
     }
 
     async fn status_of(app: Router, request: Request<Body>) -> StatusCode {
@@ -300,6 +354,62 @@ mod tests {
             .unwrap();
         let response = app().oneshot(req).await.unwrap();
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn publish_accepts_valid_events() {
+        let body = r#"{"topic":"vuln_scanner.scan","data":{"paths":["/srv"]}}"#;
+        let response = app().oneshot(publish_request(body, None)).await.unwrap();
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        let bytes = to_bytes(response.into_body(), 4096).await.unwrap();
+        let value: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(value["topic"], "vuln_scanner.scan");
+        assert_eq!(value["receivers"], 0);
+        let no_data = status_of(app(), publish_request(r#"{"topic":"host.ping"}"#, None)).await;
+        assert_eq!(no_data, StatusCode::ACCEPTED);
+    }
+
+    #[tokio::test]
+    async fn publish_rejects_bad_topics_and_data() {
+        let bad_bodies = [
+            r#"{"topic":""}"#,
+            r#"{"topic":"Bad.Topic"}"#,
+            r#"{"topic":"a..b"}"#,
+            r#"{"topic":".a"}"#,
+            r#"{"topic":"a."}"#,
+            r#"{"topic":"a b"}"#,
+            r#"{"topic":"host.x","data":[1]}"#,
+            r#"{"topic":"host.x","data":"text"}"#,
+        ];
+        for body in bad_bodies {
+            let status = status_of(app(), publish_request(body, None)).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        }
+        let too_long = format!(r#"{{"topic":"{}"}}"#, "a".repeat(MAX_TOPIC_LEN + 1));
+        let status = status_of(app(), publish_request(&too_long, None)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn publish_needs_the_token_when_one_is_set() {
+        let token = "0123456789abcdef";
+        let body = r#"{"topic":"host.ping"}"#;
+        let denied = status_of(app_with_token(token), publish_request(body, None)).await;
+        assert_eq!(denied, StatusCode::UNAUTHORIZED);
+        let bearer = format!("Bearer {token}");
+        let allowed = publish_request(body, Some(bearer.as_str()));
+        let status = status_of(app_with_token(token), allowed).await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+    }
+
+    #[test]
+    fn topic_names_are_checked() {
+        for good in ["a", "host.shutdown", "vuln_scanner.scan", "a1.b2.c3"] {
+            assert!(valid_topic(good), "rejected {good:?}");
+        }
+        for bad in ["", "A", "a-b", "a/b", "a..b", ".a", "a.", "a b", "ä"] {
+            assert!(!valid_topic(bad), "accepted {bad:?}");
+        }
     }
 
     #[tokio::test]
