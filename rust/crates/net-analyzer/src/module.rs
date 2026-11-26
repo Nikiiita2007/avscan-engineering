@@ -73,8 +73,7 @@ fn paths_from(value: Option<&Value>) -> Vec<PathBuf> {
 fn parse_rules(value: Option<&Value>, mask: bool) -> Result<Rules, ModuleError> {
     let mut rules = Rules::default();
     if let Some(v) = value {
-        rules = serde_json::from_value(v.clone())
-            .map_err(|e| config_error("rules", &e))?;
+        rules = serde_json::from_value(v.clone()).map_err(|e| config_error("rules", &e))?;
     }
     rules.mask_names = mask;
     Ok(rules)
@@ -92,7 +91,10 @@ fn parse_listen(value: Option<&Value>) -> Result<Option<SocketAddr>, ModuleError
 
 impl ModuleConfig {
     pub fn from_value(config: &Value) -> Result<Self, ModuleError> {
-        let mode = config.get("mode").and_then(Value::as_str).unwrap_or("passive");
+        let mode = config
+            .get("mode")
+            .and_then(Value::as_str)
+            .unwrap_or("passive");
         if mode != "passive" {
             let text = format!("unsupported mode '{mode}', only 'passive' is implemented");
             return Err(ModuleError::Config(text));
@@ -178,10 +180,7 @@ fn start_listener(out: &Out, config: &ModuleConfig, sink: &AlertSink) -> Option<
     }
 }
 
-fn recv<R: Read>(
-    input: &mut R,
-    frames: &mut FrameReader,
-) -> Result<Option<Message>, ModuleError> {
+fn recv<R: Read>(input: &mut R, frames: &mut FrameReader) -> Result<Option<Message>, ModuleError> {
     let mut buf = [0u8; 4096];
     loop {
         if let Some(msg) = frames.next_message()? {
@@ -200,11 +199,7 @@ enum Exit {
     Closed,
 }
 
-fn serve<R: Read>(
-    input: &mut R,
-    frames: &mut FrameReader,
-    out: &Out,
-) -> Result<Exit, ModuleError> {
+fn serve<R: Read>(input: &mut R, frames: &mut FrameReader, out: &Out) -> Result<Exit, ModuleError> {
     while let Some(msg) = recv(input, frames)? {
         match msg.msg_type.as_str() {
             "ping" => {
@@ -381,7 +376,10 @@ mod tests {
         dir.write_bytes("c2.pcap", &pcap_file(LINKTYPE_ETHERNET, &[(1.0, frame)]));
         let path = dir.path().join("c2.pcap");
         let replies = session(json!({ "pcap_paths": [path.to_str().unwrap()] }));
-        assert_eq!(types(&replies), ["hello_ack", "started", "event", "event", "stopped"]);
+        assert_eq!(
+            types(&replies),
+            ["hello_ack", "started", "event", "event", "stopped"]
+        );
         assert_eq!(replies[2].payload["topic"], ALERT_TOPIC);
         assert_eq!(replies[2].payload["data"]["rule"], "suspicious-port");
         assert_eq!(replies[3].payload["topic"], LOG_TOPIC);
@@ -391,7 +389,10 @@ mod tests {
     #[test]
     fn missing_pcap_files_are_reported_not_fatal() {
         let replies = session(json!({ "pcap_paths": ["definitely/missing.pcap"] }));
-        assert_eq!(types(&replies), ["hello_ack", "started", "event", "stopped"]);
+        assert_eq!(
+            types(&replies),
+            ["hello_ack", "started", "event", "stopped"]
+        );
         assert!(log_text(&replies[2]).contains("cannot analyze"));
     }
 
@@ -430,14 +431,20 @@ mod tests {
     #[test]
     fn listens_on_loopback_and_reports_the_address() {
         let replies = session(json!({ "listen": "127.0.0.1:0" }));
-        assert_eq!(types(&replies), ["hello_ack", "started", "event", "stopped"]);
+        assert_eq!(
+            types(&replies),
+            ["hello_ack", "started", "event", "stopped"]
+        );
         assert_eq!(log_text(&replies[2]), "listening");
     }
 
     #[test]
     fn refuses_to_listen_on_non_loopback_addresses() {
         let replies = session(json!({ "listen": "0.0.0.0:0" }));
-        assert_eq!(types(&replies), ["hello_ack", "started", "event", "stopped"]);
+        assert_eq!(
+            types(&replies),
+            ["hello_ack", "started", "event", "stopped"]
+        );
         assert!(log_text(&replies[2]).contains("cannot listen"));
     }
 

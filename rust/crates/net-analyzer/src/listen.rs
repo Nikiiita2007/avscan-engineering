@@ -94,7 +94,10 @@ impl Listener {
     pub fn start(addr: SocketAddr, rules: Rules, sink: AlertSink) -> io::Result<Self> {
         if !addr.ip().is_loopback() {
             let kind = io::ErrorKind::InvalidInput;
-            return Err(io::Error::new(kind, "listen address must be a loopback address"));
+            return Err(io::Error::new(
+                kind,
+                "listen address must be a loopback address",
+            ));
         }
         let listener = TcpListener::bind(addr)?;
         listener.set_nonblocking(true)?;
@@ -181,7 +184,12 @@ mod tests {
         let (sink, rx) = channel_sink();
         let mut listener = Listener::start(loopback(), Rules::default(), sink).unwrap();
         let mut stream = TcpStream::connect(listener.addr).unwrap();
-        stream.write_all(&[0xde, 0xad, 0xbe, 0xef, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24]).unwrap();
+        stream
+            .write_all(&[
+                0xde, 0xad, 0xbe, 0xef, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17,
+                18, 19, 20, 21, 22, 23, 24,
+            ])
+            .unwrap();
         stream.shutdown(std::net::Shutdown::Write).unwrap();
         assert!(rx.recv_timeout(Duration::from_millis(300)).is_err());
         listener.shutdown();

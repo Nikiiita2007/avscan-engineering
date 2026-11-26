@@ -248,7 +248,8 @@ impl Analyzer {
         }
 
         let tld = name.rsplit('.').next().unwrap_or("");
-        let bad_tld = name.contains('.') && self.rules.suspicious_tlds.iter().any(|t| t.as_str() == tld);
+        let bad_tld =
+            name.contains('.') && self.rules.suspicious_tlds.iter().any(|t| t.as_str() == tld);
         if bad_tld && self.first_time(name, "dns-suspicious-tld") {
             let text = "DNS name under a suspicious top-level domain";
             let found = alert("dns-suspicious-tld", Severity::Low, ts, d, text);
@@ -377,7 +378,11 @@ mod tests {
 
     #[test]
     fn flags_suspicious_tlds_once_per_name() {
-        let packets = vec![query(1.0, "evil.tk"), query(2.0, "evil.tk"), query(3.0, "ok.org")];
+        let packets = vec![
+            query(1.0, "evil.tk"),
+            query(2.0, "evil.tk"),
+            query(3.0, "ok.org"),
+        ];
         let (alerts, _) = run(&Rules::default(), &packets);
         let found = named(&alerts, "dns-suspicious-tld");
         assert_eq!(found.len(), 1);

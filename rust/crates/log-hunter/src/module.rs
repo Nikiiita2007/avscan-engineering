@@ -71,8 +71,7 @@ fn paths_from(value: Option<&Value>) -> Vec<PathBuf> {
 fn parse_rules(value: Option<&Value>, mask: bool) -> Result<Rules, ModuleError> {
     let mut rules = Rules::default();
     if let Some(v) = value {
-        rules = serde_json::from_value(v.clone())
-            .map_err(|e| config_error("rules", &e))?;
+        rules = serde_json::from_value(v.clone()).map_err(|e| config_error("rules", &e))?;
     }
     rules.mask_names = mask;
     rules.validate().map_err(ModuleError::Config)?;
@@ -148,8 +147,8 @@ fn notifier(out: &Out) -> Notify {
 
 fn analyze_file(out: &Out, path: &Path, rules: &Rules, sink: &AlertSink) {
     let file = path.display().to_string();
-    let result = File::open(path)
-        .and_then(|f| hunt_reader(BufReader::new(f), rules, |a| emit(sink, &a)));
+    let result =
+        File::open(path).and_then(|f| hunt_reader(BufReader::new(f), rules, |a| emit(sink, &a)));
     let note = match result {
         Ok(stats) => json!({ "message": "analysis finished", "file": file, "stats": stats }),
         Err(e) => json!({ "message": format!("cannot analyze: {e}"), "file": file }),
@@ -157,10 +156,7 @@ fn analyze_file(out: &Out, path: &Path, rules: &Rules, sink: &AlertSink) {
     let _ = out.event(LOG_TOPIC, note);
 }
 
-fn recv<R: Read>(
-    input: &mut R,
-    frames: &mut FrameReader,
-) -> Result<Option<Message>, ModuleError> {
+fn recv<R: Read>(input: &mut R, frames: &mut FrameReader) -> Result<Option<Message>, ModuleError> {
     let mut buf = [0u8; 4096];
     loop {
         if let Some(msg) = frames.next_message()? {
@@ -179,11 +175,7 @@ enum Exit {
     Closed,
 }
 
-fn serve<R: Read>(
-    input: &mut R,
-    frames: &mut FrameReader,
-    out: &Out,
-) -> Result<Exit, ModuleError> {
+fn serve<R: Read>(input: &mut R, frames: &mut FrameReader, out: &Out) -> Result<Exit, ModuleError> {
     while let Some(msg) = recv(input, frames)? {
         match msg.msg_type.as_str() {
             "ping" => {
@@ -293,7 +285,8 @@ mod tests {
             let n = chunk.len().min(buf.len());
             buf[..n].copy_from_slice(&chunk[..n]);
             if n < chunk.len() {
-                self.chunks.push_front((Duration::ZERO, chunk[n..].to_vec()));
+                self.chunks
+                    .push_front((Duration::ZERO, chunk[n..].to_vec()));
             }
             Ok(n)
         }
@@ -349,7 +342,9 @@ mod tests {
     }
 
     fn burst_log(dir: &TempDir) -> PathBuf {
-        let text: String = (0..5).map(|s| failed(0, s, "203.0.113.5", "root")).collect();
+        let text: String = (0..5)
+            .map(|s| failed(0, s, "203.0.113.5", "root"))
+            .collect();
         dir.write("auth.log", &text);
         dir.path().join("auth.log")
     }
@@ -394,7 +389,10 @@ mod tests {
         let dir = TempDir::new("module_once");
         let path = burst_log(&dir);
         let replies = session(json!({ "paths": [path.to_str().unwrap()] }));
-        assert_eq!(types(&replies), ["hello_ack", "started", "event", "event", "stopped"]);
+        assert_eq!(
+            types(&replies),
+            ["hello_ack", "started", "event", "event", "stopped"]
+        );
         assert_eq!(replies[2].payload["topic"], IOC_TOPIC);
         assert_eq!(replies[2].payload["data"]["rule"], "ssh-bruteforce");
         assert_eq!(replies[3].payload["topic"], LOG_TOPIC);
@@ -404,7 +402,10 @@ mod tests {
     #[test]
     fn missing_files_are_reported_not_fatal() {
         let replies = session(json!({ "paths": ["definitely/missing.log"] }));
-        assert_eq!(types(&replies), ["hello_ack", "started", "event", "stopped"]);
+        assert_eq!(
+            types(&replies),
+            ["hello_ack", "started", "event", "stopped"]
+        );
         assert!(log_text(&replies[2]).contains("cannot analyze"));
     }
 
@@ -433,7 +434,9 @@ mod tests {
             .map(|m| &m.payload["data"]["rule"])
             .collect();
         assert_eq!(rules, ["ssh-bruteforce"]);
-        assert!(replies.iter().any(|m| m.payload["data"]["message"].as_str().is_some_and(|t| t.starts_with("following"))));
+        assert!(replies.iter().any(|m| m.payload["data"]["message"]
+            .as_str()
+            .is_some_and(|t| t.starts_with("following"))));
     }
 
     #[test]

@@ -17,11 +17,22 @@ pub enum EventKind {
         ip: IpAddr,
         method: String,
     },
-    InvalidUser { user: String, ip: IpAddr },
-    SudoFailure { user: String },
-    NotInSudoers { user: String },
-    SuFailure { user: String },
-    AccountCreated { name: String },
+    InvalidUser {
+        user: String,
+        ip: IpAddr,
+    },
+    SudoFailure {
+        user: String,
+    },
+    NotInSudoers {
+        user: String,
+    },
+    SuFailure {
+        user: String,
+    },
+    AccountCreated {
+        name: String,
+    },
 }
 
 /// One recognized log event with its timestamp.
@@ -306,15 +317,41 @@ mod tests {
     #[test]
     fn parses_sudo_su_and_useradd_lines() {
         let pam = "Nov 26 14:06:00 srv sudo: pam_unix(sudo:auth): authentication failure; logname=bob uid=1000 euid=0 ruser=bob rhost=  user=bob";
-        assert_eq!(kind(pam), EventKind::SudoFailure { user: "bob".to_string() });
+        assert_eq!(
+            kind(pam),
+            EventKind::SudoFailure {
+                user: "bob".to_string()
+            }
+        );
         let attempts = "Nov 26 14:06:01 srv sudo:      bob : 3 incorrect password attempts ; TTY=pts/0 ; USER=root";
-        assert_eq!(kind(attempts), EventKind::SudoFailure { user: "bob".to_string() });
-        let denied = "Nov 26 14:06:02 srv sudo:    eve : user NOT in sudoers ; TTY=pts/1 ; USER=root";
-        assert_eq!(kind(denied), EventKind::NotInSudoers { user: "eve".to_string() });
+        assert_eq!(
+            kind(attempts),
+            EventKind::SudoFailure {
+                user: "bob".to_string()
+            }
+        );
+        let denied =
+            "Nov 26 14:06:02 srv sudo:    eve : user NOT in sudoers ; TTY=pts/1 ; USER=root";
+        assert_eq!(
+            kind(denied),
+            EventKind::NotInSudoers {
+                user: "eve".to_string()
+            }
+        );
         let su = "Nov 26 14:06:03 srv su[55]: FAILED SU (to root) bob on pts/0";
-        assert_eq!(kind(su), EventKind::SuFailure { user: "bob".to_string() });
+        assert_eq!(
+            kind(su),
+            EventKind::SuFailure {
+                user: "bob".to_string()
+            }
+        );
         let add = "Nov 26 14:06:04 srv useradd[77]: new user: name=evil, UID=1001, GID=1001, home=/home/evil";
-        assert_eq!(kind(add), EventKind::AccountCreated { name: "evil".to_string() });
+        assert_eq!(
+            kind(add),
+            EventKind::AccountCreated {
+                name: "evil".to_string()
+            }
+        );
     }
 
     #[test]
@@ -322,17 +359,24 @@ mod tests {
         assert!(parse_line("").is_none());
         assert!(parse_line("garbage").is_none());
         assert!(parse_line("Nov 26 14:02:11 srv cron[1]: (root) CMD (run-parts)").is_none());
-        assert!(parse_line("Nov 26 14:02:11 srv sshd[1]: Server listening on 0.0.0.0 port 22.").is_none());
-        let hostname = "Nov 26 14:02:11 srv sshd[1]: Failed password for root from evil.example.com port 22";
+        assert!(
+            parse_line("Nov 26 14:02:11 srv sshd[1]: Server listening on 0.0.0.0 port 22.")
+                .is_none()
+        );
+        let hostname =
+            "Nov 26 14:02:11 srv sshd[1]: Failed password for root from evil.example.com port 22";
         assert!(parse_line(hostname).is_none());
         assert!(parse_line("Xxx 26 14:02:11 srv sshd[1]: Invalid user a from 1.2.3.4").is_none());
     }
 
     #[test]
     fn classic_timestamps_are_relative_and_year_less() {
-        let a = parse_line("Nov 26 14:02:11 srv sshd[1]: Invalid user a from 1.2.3.4 port 1").unwrap();
-        let b = parse_line("Nov 26 14:02:41 srv sshd[1]: Invalid user a from 1.2.3.4 port 1").unwrap();
-        let padded = parse_line("Nov  6 14:02:41 srv sshd[1]: Invalid user a from 1.2.3.4 port 1").unwrap();
+        let a =
+            parse_line("Nov 26 14:02:11 srv sshd[1]: Invalid user a from 1.2.3.4 port 1").unwrap();
+        let b =
+            parse_line("Nov 26 14:02:41 srv sshd[1]: Invalid user a from 1.2.3.4 port 1").unwrap();
+        let padded =
+            parse_line("Nov  6 14:02:41 srv sshd[1]: Invalid user a from 1.2.3.4 port 1").unwrap();
         assert!(!a.has_year);
         assert_eq!(b.timestamp - a.timestamp, 30.0);
         assert!(padded.timestamp < a.timestamp);
@@ -341,7 +385,8 @@ mod tests {
     #[test]
     fn iso_timestamps_honor_the_utc_offset() {
         let utc = "2026-11-26T14:02:11Z srv sshd[1]: Invalid user a from 1.2.3.4 port 1";
-        let plus3 = "2026-11-26T14:02:11.123456+03:00 srv sshd[1]: Invalid user a from 1.2.3.4 port 1";
+        let plus3 =
+            "2026-11-26T14:02:11.123456+03:00 srv sshd[1]: Invalid user a from 1.2.3.4 port 1";
         let a = parse_line(utc).unwrap();
         let b = parse_line(plus3).unwrap();
         assert!(a.has_year && b.has_year);
@@ -353,6 +398,9 @@ mod tests {
     fn civil_dates_convert_to_days() {
         assert_eq!(days_from_civil(1970, 1, 1), 0);
         assert_eq!(days_from_civil(2000, 3, 1), 11_017);
-        assert_eq!(days_from_civil(2001, 1, 1) + 365, days_from_civil(2002, 1, 1));
+        assert_eq!(
+            days_from_civil(2001, 1, 1) + 365,
+            days_from_civil(2002, 1, 1)
+        );
     }
 }

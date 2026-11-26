@@ -371,14 +371,20 @@ mod tests {
             ..Rules::default()
         };
         let alerts = hunt(&open, text);
-        assert!(named(&alerts, "ssh-user-enumeration")[0].message.contains("oracle"));
+        assert!(named(&alerts, "ssh-user-enumeration")[0]
+            .message
+            .contains("oracle"));
     }
 
     #[test]
     fn flags_a_successful_login_after_failures() {
         let mut text: String = (0..3).map(|s| failed(0, s, IP, "bob")).collect();
-        text.push_str("Nov 26 14:00:10 srv sshd[1]: Accepted password for bob from 203.0.113.5 port 9\n");
-        text.push_str("Nov 26 14:00:11 srv sshd[1]: Accepted password for bob from 198.51.100.1 port 9\n");
+        text.push_str(
+            "Nov 26 14:00:10 srv sshd[1]: Accepted password for bob from 203.0.113.5 port 9\n",
+        );
+        text.push_str(
+            "Nov 26 14:00:11 srv sshd[1]: Accepted password for bob from 198.51.100.1 port 9\n",
+        );
         let alerts = hunt(&Rules::default(), &text);
         let found = named(&alerts, "ssh-login-after-failures");
         assert_eq!(found.len(), 1);
@@ -389,9 +395,14 @@ mod tests {
 
     #[test]
     fn flags_root_password_logins_only() {
-        let password = "Nov 26 14:00:00 srv sshd[1]: Accepted password for root from 198.51.100.1 port 9\n";
-        let key = "Nov 26 14:00:00 srv sshd[1]: Accepted publickey for root from 198.51.100.1 port 9\n";
-        assert_eq!(named(&hunt(&Rules::default(), password), "root-password-login").len(), 1);
+        let password =
+            "Nov 26 14:00:00 srv sshd[1]: Accepted password for root from 198.51.100.1 port 9\n";
+        let key =
+            "Nov 26 14:00:00 srv sshd[1]: Accepted publickey for root from 198.51.100.1 port 9\n";
+        assert_eq!(
+            named(&hunt(&Rules::default(), password), "root-password-login").len(),
+            1
+        );
         assert!(hunt(&Rules::default(), key).is_empty());
         let quiet = Rules {
             alert_root_password_login: false,
@@ -402,7 +413,8 @@ mod tests {
 
     #[test]
     fn reports_repeated_sudo_and_su_failures() {
-        let sudo = "Nov 26 14:00:00 srv sudo: pam_unix(sudo:auth): authentication failure; user=bob\n";
+        let sudo =
+            "Nov 26 14:00:00 srv sudo: pam_unix(sudo:auth): authentication failure; user=bob\n";
         let su = "Nov 26 14:00:00 srv su[5]: FAILED SU (to root) eve on pts/0\n";
         let alerts = hunt(&Rules::default(), &sudo.repeat(3));
         let found = named(&alerts, "sudo-failures");
@@ -415,7 +427,8 @@ mod tests {
 
     #[test]
     fn reports_sudoers_violations_and_new_accounts_once() {
-        let denied = "Nov 26 14:00:00 srv sudo: eve : user NOT in sudoers ; TTY=pts/1 ; USER=root\n";
+        let denied =
+            "Nov 26 14:00:00 srv sudo: eve : user NOT in sudoers ; TTY=pts/1 ; USER=root\n";
         let add = "Nov 26 14:00:00 srv useradd[7]: new user: name=evil, UID=1001, GID=1001\n";
         let alerts = hunt(&Rules::default(), &denied.repeat(2));
         assert_eq!(named(&alerts, "sudo-not-in-sudoers").len(), 1);
@@ -444,12 +457,25 @@ mod tests {
 
     #[test]
     fn the_year_change_does_not_keep_old_failures_alive() {
-        let december = "Dec 31 23:59:00 srv sshd[1]: Failed password for root from 203.0.113.5 port 1\n";
-        let january = "Jan  1 00:10:00 srv sshd[1]: Failed password for root from 203.0.113.5 port 1\n";
+        let december =
+            "Dec 31 23:59:00 srv sshd[1]: Failed password for root from 203.0.113.5 port 1\n";
+        let january =
+            "Jan  1 00:10:00 srv sshd[1]: Failed password for root from 203.0.113.5 port 1\n";
         let text = format!("{}{january}", december.repeat(4));
         assert!(hunt(&Rules::default(), &text).is_empty());
-        let burst = format!("{}{}", december.repeat(3), january.replace("00:10:00", "00:00:30"));
-        assert_eq!(named(&hunt(&Rules::default(), &format!("{burst}{december}")), "ssh-bruteforce").len(), 0);
+        let burst = format!(
+            "{}{}",
+            december.repeat(3),
+            january.replace("00:10:00", "00:00:30")
+        );
+        assert_eq!(
+            named(
+                &hunt(&Rules::default(), &format!("{burst}{december}")),
+                "ssh-bruteforce"
+            )
+            .len(),
+            0
+        );
     }
 
     #[test]

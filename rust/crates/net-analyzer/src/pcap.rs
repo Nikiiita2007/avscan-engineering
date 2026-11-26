@@ -122,7 +122,10 @@ mod tests {
     use crate::test_util::pcap_file;
 
     fn sample() -> Vec<u8> {
-        pcap_file(LINKTYPE_ETHERNET, &[(1.5, vec![1, 2, 3]), (2.25, vec![4, 5])])
+        pcap_file(
+            LINKTYPE_ETHERNET,
+            &[(1.5, vec![1, 2, 3]), (2.25, vec![4, 5])],
+        )
     }
 
     #[test]
