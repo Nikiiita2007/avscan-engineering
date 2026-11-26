@@ -12,11 +12,19 @@
 //! refused request is reported as a `log` message. In both cases every path is
 //! resolved (symlinks included) and must lie inside one of the `command_roots`.
 //! Without `command_roots` the configured `paths` are the roots; with neither,
-//! the request is refused. Scans run on the protocol thread, so a large tree
-//! delays `ping` answers until it is done.
+//! the request is refused.
+//!
+//! The scan of a command or an event runs on a worker thread (at most
+//! `MAX_WORKERS` at a time), so `ping` is answered while it runs; `stop` waits
+//! for the scans that are still running. The paths named in the start config
+//! are scanned before the module serves requests, so a large tree delays the
+//! first `ping` answer.
 
 use std::io::{Read, Write};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Mutex;
+use std::thread::Scope;
 
 use avscan_protocol::{encode_frame, FrameReader, Message, ProtocolError};
 use serde_json::{json, Value};
@@ -30,6 +38,8 @@ pub const REPORT_TOPIC: &str = "vuln_scanner.report";
 pub const CAPABILITIES: [&str; 2] = ["vuln.scan_files", "report.mask_sensitive"];
 const SCAN_COMMAND: &str = "vuln.scan_files";
 const HOST_API: i64 = 1;
+/// How many scans may run at the same time.
+const MAX_WORKERS: usize = 4;
 
 /// Errors that end a module session.
 #[derive(Debug, Error)]
@@ -42,6 +52,8 @@ pub enum ModuleError {
     Json(#[from] serde_json::Error),
     #[error("{0}")]
     Handshake(String),
+    #[error("output lock poisoned")]
+    Poisoned,
 }
 
 /// Module configuration taken from the `start` message.
@@ -104,41 +116,39 @@ fn reply(msg_type: &str, payload: Value) -> Message {
         .with_payload(payload)
 }
 
-struct Channel<R, W> {
-    input: R,
-    output: W,
-    frames: FrameReader,
+/// The output stream, shared by the protocol thread and the scan threads.
+struct Out<W> {
+    inner: Mutex<W>,
 }
 
-impl<R: Read, W: Write> Channel<R, W> {
-    fn new(input: R, output: W) -> Self {
+impl<W: Write> Out<W> {
+    fn new(output: W) -> Self {
         Self {
-            input,
-            output,
-            frames: FrameReader::new(),
+            inner: Mutex::new(output),
         }
     }
 
-    /// Next message, or `None` when the host closed the input.
-    fn recv(&mut self) -> Result<Option<Message>, ModuleError> {
-        let mut buf = [0u8; 4096];
-        loop {
-            if let Some(msg) = self.frames.next_message()? {
-                return Ok(Some(msg));
-            }
-            let n = self.input.read(&mut buf)?;
-            if n == 0 {
-                return Ok(None);
-            }
-            self.frames.feed(&buf[..n]);
-        }
-    }
-
-    fn send(&mut self, msg: &Message) -> Result<(), ModuleError> {
+    fn send(&self, msg: &Message) -> Result<(), ModuleError> {
         let frame = encode_frame(msg)?;
-        self.output.write_all(&frame)?;
-        self.output.flush()?;
+        let mut out = self.inner.lock().map_err(|_| ModuleError::Poisoned)?;
+        out.write_all(&frame)?;
+        out.flush()?;
         Ok(())
+    }
+}
+
+/// Next message, or `None` when the host closed the input.
+fn recv<R: Read>(input: &mut R, frames: &mut FrameReader) -> Result<Option<Message>, ModuleError> {
+    let mut buf = [0u8; 4096];
+    loop {
+        if let Some(msg) = frames.next_message()? {
+            return Ok(Some(msg));
+        }
+        let n = input.read(&mut buf)?;
+        if n == 0 {
+            return Ok(None);
+        }
+        frames.feed(&buf[..n]);
     }
 }
 
@@ -150,19 +160,19 @@ fn report_event(report: &crate::report::Report) -> Result<Message, ModuleError> 
     ))
 }
 
-fn publish_scan<R: Read, W: Write>(
-    ch: &mut Channel<R, W>,
+fn publish_scan<W: Write>(
+    out: &Out<W>,
     paths: &[PathBuf],
     options: &ScanOptions,
 ) -> Result<(), ModuleError> {
     let mut report = scan_paths(paths, options);
     let event = report_event(&report)?;
-    match ch.send(&event) {
+    match out.send(&event) {
         Err(ModuleError::Protocol(ProtocolError::FrameTooLarge)) => {
             report.findings.clear();
             report.truncated = true;
             let event = report_event(&report)?;
-            ch.send(&event)
+            out.send(&event)
         }
         other => other,
     }
@@ -190,12 +200,65 @@ fn check_paths(paths: &[PathBuf], roots: &[PathBuf]) -> Result<Vec<PathBuf>, Str
     Ok(checked)
 }
 
+fn result_message(id: Option<&str>, ok: bool, error: Option<&str>) -> Message {
+    let mut payload = json!({ "ok": ok });
+    if let Some(text) = error {
+        payload["error"] = json!(text);
+    }
+    let mut result = reply("command_result", payload);
+    result.id = id.map(str::to_string);
+    result
+}
+
+fn command_result(request: &Message, ok: bool, error: Option<&str>) -> Message {
+    result_message(request.id.as_deref(), ok, error)
+}
+
+/// Whether a finished scan is answered with a `command_result`.
+enum Answer {
+    /// A bus event has no answer.
+    Silent,
+    /// A command: the request id to answer.
+    Command(Option<String>),
+}
+
+/// Starts a scan on a worker thread. Returns false, and starts nothing, when
+/// `MAX_WORKERS` scans already run. Only the protocol thread calls this, so the
+/// counter needs no compare-and-swap. The scope joins every worker.
+fn spawn_scan<'scope, 'env, W: Write + Send>(
+    scope: &'scope Scope<'scope, 'env>,
+    out: &'env Out<W>,
+    active: &'env AtomicUsize,
+    options: &'env ScanOptions,
+    paths: Vec<PathBuf>,
+    answer: Answer,
+) -> bool {
+    if active.load(Ordering::SeqCst) >= MAX_WORKERS {
+        return false;
+    }
+    active.fetch_add(1, Ordering::SeqCst);
+    scope.spawn(move || {
+        let outcome = publish_scan(out, &paths, options);
+        if let Answer::Command(id) = answer {
+            let result = match outcome {
+                Ok(()) => result_message(id.as_deref(), true, None),
+                Err(e) => result_message(id.as_deref(), false, Some(e.to_string().as_str())),
+            };
+            let _ = out.send(&result);
+        }
+        active.fetch_sub(1, Ordering::SeqCst);
+    });
+    true
+}
+
 /// Handles a bus event. Only `vuln_scanner.scan` is acted on; a refused
 /// request is reported as a `log` message because events have no answer.
-fn handle_event<R: Read, W: Write>(
-    ch: &mut Channel<R, W>,
+fn handle_event<'scope, 'env, W: Write + Send>(
+    scope: &'scope Scope<'scope, 'env>,
     msg: &Message,
-    config: &ModuleConfig,
+    out: &'env Out<W>,
+    config: &'env ModuleConfig,
+    active: &'env AtomicUsize,
 ) -> Result<(), ModuleError> {
     let topic = msg.payload.get("topic").and_then(Value::as_str);
     if topic != Some(SCAN_TOPIC) {
@@ -205,34 +268,31 @@ fn handle_event<R: Read, W: Write>(
     let requested = paths_from(data.and_then(|d| d.get("paths")));
     if requested.is_empty() {
         let note = json!({ "message": "scan request without paths ignored" });
-        return ch.send(&reply("log", note));
+        return out.send(&reply("log", note));
     }
     let paths = match check_paths(&requested, &config.command_roots) {
         Ok(paths) => paths,
         Err(text) => {
             let note = json!({ "message": format!("scan request refused: {text}") });
-            return ch.send(&reply("log", note));
+            return out.send(&reply("log", note));
         }
     };
-    publish_scan(ch, &paths, &config.options)
-}
-
-fn command_result(request: &Message, ok: bool, error: Option<&str>) -> Message {
-    let mut payload = json!({ "ok": ok });
-    if let Some(text) = error {
-        payload["error"] = json!(text);
+    if !spawn_scan(scope, out, active, &config.options, paths, Answer::Silent) {
+        let note = json!({ "message": "scan request refused: too many scans are running" });
+        return out.send(&reply("log", note));
     }
-    let mut result = reply("command_result", payload);
-    result.id = request.id.clone();
-    result
+    Ok(())
 }
 
-/// Answers one `command`. Unknown commands and bad arguments are reported in
-/// the result (`ok: false`); they do not end the session.
-fn handle_command<R: Read, W: Write>(
-    ch: &mut Channel<R, W>,
+/// Answers one `command`. Unknown commands and bad arguments are answered at
+/// once with `ok: false`; a valid `vuln.scan_files` is answered by its worker
+/// thread when the scan is done. Neither ends the session.
+fn handle_command<'scope, 'env, W: Write + Send>(
+    scope: &'scope Scope<'scope, 'env>,
     request: &Message,
-    config: &ModuleConfig,
+    out: &'env Out<W>,
+    config: &'env ModuleConfig,
+    active: &'env AtomicUsize,
 ) -> Result<(), ModuleError> {
     let name = request
         .payload
@@ -241,29 +301,35 @@ fn handle_command<R: Read, W: Write>(
         .unwrap_or("");
     if name != SCAN_COMMAND {
         let text = format!("unsupported command '{name}'");
-        return ch.send(&command_result(request, false, Some(text.as_str())));
+        return out.send(&command_result(request, false, Some(text.as_str())));
     }
     let args = request.payload.get("args");
     let requested = paths_from(args.and_then(|a| a.get("paths")));
     if requested.is_empty() {
         let text = "args.paths must list at least one path";
-        return ch.send(&command_result(request, false, Some(text)));
+        return out.send(&command_result(request, false, Some(text)));
     }
     let paths = match check_paths(&requested, &config.command_roots) {
         Ok(paths) => paths,
         Err(text) => {
-            return ch.send(&command_result(request, false, Some(text.as_str())));
+            return out.send(&command_result(request, false, Some(text.as_str())));
         }
     };
-    publish_scan(ch, &paths, &config.options)?;
-    ch.send(&command_result(request, true, None))
+    let answer = Answer::Command(request.id.clone());
+    if !spawn_scan(scope, out, active, &config.options, paths, answer) {
+        let text = "too many scans are running";
+        return out.send(&command_result(request, false, Some(text)));
+    }
+    Ok(())
 }
 
 /// Runs one module session until `stop` or until the host closes the input.
-pub fn run<R: Read, W: Write>(input: R, output: W) -> Result<(), ModuleError> {
-    let mut ch = Channel::new(input, output);
+/// `stop` and the end of the input both wait for the scans that still run.
+pub fn run<R: Read, W: Write + Send>(mut input: R, output: W) -> Result<(), ModuleError> {
+    let out = Out::new(output);
+    let mut frames = FrameReader::new();
 
-    let Some(hello) = ch.recv()? else {
+    let Some(hello) = recv(&mut input, &mut frames)? else {
         return Ok(());
     };
     let host_api = hello.payload.get("host_api").and_then(Value::as_i64);
@@ -277,9 +343,9 @@ pub fn run<R: Read, W: Write>(input: R, output: W) -> Result<(), ModuleError> {
         "module_version": env!("CARGO_PKG_VERSION"),
         "capabilities": CAPABILITIES,
     });
-    ch.send(&reply("hello_ack", ack))?;
+    out.send(&reply("hello_ack", ack))?;
 
-    let Some(start) = ch.recv()? else {
+    let Some(start) = recv(&mut input, &mut frames)? else {
         return Ok(());
     };
     if start.msg_type != "start" {
@@ -287,26 +353,30 @@ pub fn run<R: Read, W: Write>(input: R, output: W) -> Result<(), ModuleError> {
     }
     let config_value = start.payload.get("config").cloned().unwrap_or(Value::Null);
     let config = ModuleConfig::from_value(&config_value);
-    ch.send(&reply("started", json!({})))?;
+    out.send(&reply("started", json!({})))?;
     if !config.paths.is_empty() {
-        publish_scan(&mut ch, &config.paths, &config.options)?;
+        publish_scan(&out, &config.paths, &config.options)?;
     }
 
-    while let Some(msg) = ch.recv()? {
-        match msg.msg_type.as_str() {
-            "ping" => {
-                let mut pong = reply("pong", json!({}));
-                pong.id = msg.id.clone();
-                ch.send(&pong)?;
+    let active = AtomicUsize::new(0);
+    let stopped = std::thread::scope(|scope| -> Result<bool, ModuleError> {
+        while let Some(msg) = recv(&mut input, &mut frames)? {
+            match msg.msg_type.as_str() {
+                "ping" => {
+                    let mut pong = reply("pong", json!({}));
+                    pong.id = msg.id.clone();
+                    out.send(&pong)?;
+                }
+                "stop" => return Ok(true),
+                "event" => handle_event(scope, &msg, &out, &config, &active)?,
+                "command" => handle_command(scope, &msg, &out, &config, &active)?,
+                _ => {}
             }
-            "stop" => {
-                ch.send(&reply("stopped", json!({})))?;
-                return Ok(());
-            }
-            "event" => handle_event(&mut ch, &msg, &config)?,
-            "command" => handle_command(&mut ch, &msg, &config)?,
-            _ => {}
         }
+        Ok(false)
+    })?;
+    if stopped {
+        out.send(&reply("stopped", json!({})))?;
     }
     Ok(())
 }
@@ -477,6 +547,59 @@ mod tests {
         assert_eq!(report["findings"][0]["rule"], "docker-eol-image");
         assert_eq!(replies[3].id.as_deref(), Some("cmd-1"));
         assert_eq!(replies[3].payload["ok"], json!(true));
+    }
+
+    #[test]
+    fn ping_is_answered_while_a_scan_is_handled() {
+        let dir = TempDir::new("module_ping_scan");
+        dir.write("Dockerfile", "FROM ubuntu:16.04\nUSER app\n");
+        let root = dir.path().to_str().unwrap().to_string();
+        let args = json!({ "paths": [dir.path().to_str().unwrap()] });
+        let mut messages = handshake(json!({ "command_roots": [root] }));
+        messages.push(command_msg("cmd-1", SCAN_COMMAND, args));
+        messages.push(host_msg("ping", json!({})).with_id("ping-1"));
+        messages.push(host_msg("stop", json!({})));
+        let replies = run_session(messages).unwrap();
+        let kinds = types(&replies);
+        assert!(kinds.contains(&"pong"));
+        assert_eq!(kinds.last(), Some(&"stopped"));
+        let at = kinds.iter().position(|k| *k == "command_result").unwrap();
+        let events_before = kinds[..at].iter().filter(|k| **k == "event").count();
+        assert_eq!(events_before, 1);
+        assert_eq!(replies[at].id.as_deref(), Some("cmd-1"));
+        assert_eq!(replies[at].payload["ok"], json!(true));
+    }
+
+    #[test]
+    fn scans_are_refused_when_all_slots_are_busy() {
+        let out = Out::new(Vec::<u8>::new());
+        let active = AtomicUsize::new(MAX_WORKERS);
+        let options = ScanOptions::default();
+        std::thread::scope(|scope| {
+            let started = spawn_scan(scope, &out, &active, &options, Vec::new(), Answer::Silent);
+            assert!(!started);
+        });
+        assert_eq!(active.load(Ordering::SeqCst), MAX_WORKERS);
+    }
+
+    #[test]
+    fn a_finished_scan_frees_its_slot_and_answers() {
+        let dir = TempDir::new("module_slot");
+        dir.write("Dockerfile", "FROM ubuntu:16.04\n");
+        let out = Out::new(Vec::<u8>::new());
+        let active = AtomicUsize::new(0);
+        let options = ScanOptions::default();
+        std::thread::scope(|scope| {
+            let paths = vec![dir.path().to_path_buf()];
+            let answer = Answer::Command(Some("cmd-1".to_string()));
+            let started = spawn_scan(scope, &out, &active, &options, paths, answer);
+            assert!(started);
+        });
+        assert_eq!(active.load(Ordering::SeqCst), 0);
+        let bytes = out.inner.lock().unwrap().clone();
+        let messages = decode_all(&bytes);
+        assert_eq!(types(&messages), ["event", "command_result"]);
+        assert_eq!(messages[1].id.as_deref(), Some("cmd-1"));
     }
 
     #[test]

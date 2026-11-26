@@ -43,7 +43,8 @@ fn main() -> ExitCode {
         eprintln!("{USAGE}");
         return ExitCode::from(2);
     }
-    match module::run(std::io::stdin().lock(), std::io::stdout().lock()) {
+    // `Stdout` (not its lock) is `Send`, so scan threads may share the output.
+    match module::run(std::io::stdin().lock(), std::io::stdout()) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("vuln-scanner: {e}");
