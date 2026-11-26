@@ -24,6 +24,9 @@ use crate::session::{CommandOutcome, Connection, HostCommand, Session, SessionEn
 /// Commands that may wait for one module before the caller gets `QueueFull`.
 const COMMAND_QUEUE: usize = 16;
 
+/// Source name of events published by the orchestrator itself.
+pub const HOST_SOURCE: &str = "host";
+
 /// Lifecycle state of one supervised module.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ModuleStatus {
@@ -280,6 +283,18 @@ impl Orchestrator {
         self.bus.subscribe()
     }
 
+    /// Publishes an event from the host. Modules whose manifest `subscribes`
+    /// list matches the topic receive it. Returns how many receivers the bus
+    /// had (modules and SSE clients alike); it does not mean delivery.
+    pub fn publish(&self, topic: &str, data: Value) -> usize {
+        let event = BusEvent {
+            topic: topic.to_string(),
+            data,
+            source: HOST_SOURCE.to_string(),
+        };
+        self.bus.send(event).unwrap_or(0)
+    }
+
     /// Current status of every module.
     pub fn statuses(&self) -> Vec<(String, ModuleStatus)> {
         let current = |m: &ModuleEntry| (m.spec.manifest.id.clone(), m.status.borrow().clone());
@@ -353,6 +368,7 @@ impl Orchestrator {
 mod tests {
     use super::*;
 
+    use serde_json::json;
     use tokio::time::timeout;
 
     fn spec_for(policy: &str, max: u32) -> ModuleSpec {
@@ -464,6 +480,22 @@ mod tests {
         })
         .await;
         assert!(stopped.is_ok(), "module did not reach Stopped");
+        orch.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn publish_reaches_subscribers_with_the_host_as_source() {
+        let orch = Orchestrator::start(Vec::new(), fast_opts());
+        let mut events = orch.subscribe();
+        let receivers = orch.publish("host.scan", json!({ "path": "/x" }));
+        assert_eq!(receivers, 1);
+        let event = timeout(Duration::from_secs(1), events.recv())
+            .await
+            .expect("no event")
+            .expect("bus closed");
+        assert_eq!(event.topic, "host.scan");
+        assert_eq!(event.source, HOST_SOURCE);
+        assert_eq!(event.data["path"], "/x");
         orch.shutdown().await;
     }
 }
