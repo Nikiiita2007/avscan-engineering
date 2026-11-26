@@ -15,7 +15,8 @@ use tokio::time::{sleep, timeout, Instant};
 
 const WAIT: Duration = Duration::from_secs(20);
 const MODULE_ID: &str = "log_hunter";
-const LOG_LINE: &str = "Nov 26 14:02:11 host sshd[1]: Failed password for root from 203.0.113.5 port 22 ssh2\n";
+const LOG_LINE: &str =
+    "Nov 26 14:02:11 host sshd[1]: Failed password for root from 203.0.113.5 port 22 ssh2\n";
 
 fn spec() -> ModuleSpec {
     let text = include_str!("../../../modules/log_hunter/module.json");
