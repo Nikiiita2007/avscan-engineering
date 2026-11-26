@@ -201,7 +201,11 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> Session<R, W> {
 
     /// Serves the session until shutdown is requested or the module fails.
     /// `idle` is how long to wait for traffic before sending a `ping`.
-    pub async fn run(&mut self, shutdown: &mut watch::Receiver<bool>, idle: Duration) -> SessionEnd {
+    pub async fn run(
+        &mut self,
+        shutdown: &mut watch::Receiver<bool>,
+        idle: Duration,
+    ) -> SessionEnd {
         loop {
             if *shutdown.borrow() {
                 return SessionEnd::Shutdown {
@@ -244,7 +248,11 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> Session<R, W> {
                 warn!(module = %self.manifest.id, error = text, "module reported an error");
             }
             "stopped" => return Err(violation("module stopped on its own")),
-            other => return Err(violation(format!("unexpected message '{other}' from module"))),
+            other => {
+                return Err(violation(format!(
+                    "unexpected message '{other}' from module"
+                )))
+            }
         }
         Ok(())
     }
@@ -291,7 +299,9 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> Session<R, W> {
             return Err(violation("module api_version differs from its manifest"));
         }
         if p.get("module_version").and_then(Value::as_str) != Some(self.manifest.version.as_str()) {
-            return Err(violation("module version differs from the manifest version"));
+            return Err(violation(
+                "module version differs from the manifest version",
+            ));
         }
         let Some(caps) = p.get("capabilities").and_then(Value::as_array) else {
             return Err(violation("hello_ack must list capabilities"));
@@ -323,7 +333,11 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> Session<R, W> {
             warn!(module = %self.manifest.id, topic, "dropped event with undeclared topic");
             return;
         }
-        let data = msg.payload.get("data").cloned().unwrap_or_else(|| json!({}));
+        let data = msg
+            .payload
+            .get("data")
+            .cloned()
+            .unwrap_or_else(|| json!({}));
         let event = BusEvent {
             topic: topic.to_string(),
             data,

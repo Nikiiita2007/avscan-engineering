@@ -233,9 +233,8 @@ impl Orchestrator {
 
     /// Current status of every module.
     pub fn statuses(&self) -> Vec<(String, ModuleStatus)> {
-        let current = |(id, rx): &(String, watch::Receiver<ModuleStatus>)| {
-            (id.clone(), rx.borrow().clone())
-        };
+        let current =
+            |(id, rx): &(String, watch::Receiver<ModuleStatus>)| (id.clone(), rx.borrow().clone());
         self.modules.iter().map(current).collect()
     }
 
