@@ -1,6 +1,6 @@
 # Protocol: command and command_result
 
-Status: stage 6.2 (protocol, HTTP), 6.3 (CLI client), 6.4 (path restriction) and 6.5 (API token). The C++ host does not send or accept these messages yet; mirror them in `libs/host` before relying on them across both hosts.
+Status: stage 6.2 (protocol, HTTP), 6.3 (CLI client), 6.4 (path restriction), 6.5 (API token) and 6.6 (`vuln_scanner`). The C++ host does not send or accept these messages yet; mirror them in `libs/host` before relying on them across both hosts.
 
 ## command (host to module)
 - `type`: `command`, `id`: request id (`cmd-N`, at most 64 chars), `module`: module id.
@@ -41,13 +41,15 @@ orchestrator modules
 orchestrator stop log_hunter
 orchestrator start log_hunter
 orchestrator exec log_hunter log.hunt --args '{"paths":["/var/log/auth.log"]}'
+orchestrator exec vuln_scanner vuln.scan_files --args '{"paths":["/srv/project"]}'
 ```
 
 ## Modules
-- `log_hunter` answers `log.hunt` (args: `paths`). Files are analyzed on the protocol thread, so a large file delays `ping` answers.
-- `log.hunt` reads only inside `command_roots` (module config, list of directories). Paths are resolved with symlinks before the check. Without `command_roots` the directories of the configured `paths` are used; with neither, the command is refused. With the default manifest this means `/var/log`.
-- `net-analyzer` and `vuln-scanner` do not handle `command` yet.
+- `log_hunter` answers `log.hunt` (args: `paths`). `vuln_scanner` answers `vuln.scan_files` (args: `paths`) and publishes the result as `vuln_scanner.report` before the `command_result`.
+- Both read only inside `command_roots` (module config, list of paths). Paths are resolved with symlinks before the check. Without `command_roots`, `log_hunter` uses the directories of its configured `paths` (default manifest: `/var/log`) and `vuln_scanner` uses its configured `paths` (default manifest: empty, so the command is refused until `command_roots` or `paths` is set).
+- Both modules work on the protocol thread, so a large file or tree delays `ping` answers.
+- `net-analyzer` does not handle `command` yet. Its draft manifest declares `net.analyze`, needs the `admin` permission and is not modified by the Rust crate.
 
 ## Not done yet
 - Updating `libs/host` (C++) and the message list in the `avscan-protocol` docs.
-- `command` support in `net-analyzer` and `vuln-scanner`.
+- `command` support in `net-analyzer`.
