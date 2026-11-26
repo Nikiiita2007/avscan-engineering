@@ -434,7 +434,12 @@ mod tests {
 
     #[tokio::test]
     async fn loopback_hosts_are_accepted() {
-        let local = ["127.0.0.1:8787", "localhost:8787", "LOCALHOST", "[::1]:8787"];
+        let local = [
+            "127.0.0.1:8787",
+            "localhost:8787",
+            "LOCALHOST",
+            "[::1]:8787",
+        ];
         for host in local {
             let req = request_with("GET", "/health", &[("host", host)]);
             let status = status_of(app(), req).await;
