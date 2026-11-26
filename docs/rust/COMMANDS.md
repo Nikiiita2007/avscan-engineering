@@ -1,6 +1,6 @@
 # Protocol: command and command_result
 
-Status: stage 6.2 (protocol, HTTP), 6.3 (CLI client), 6.4 (path restriction), 6.5 (API token), 6.6 (`vuln_scanner`) and 6.7 (`net_analyzer`). The C++ host does not send or accept these messages yet; mirror them in `libs/host` before relying on them across both hosts.
+Status: stage 6.2 (protocol, HTTP), 6.3 (CLI client), 6.4 (path restriction), 6.5 (API token), 6.6 (`vuln_scanner`), 6.7 (`net_analyzer`) and 6.8 (C++ host). Both the Rust orchestrator and the C++ `ModuleHost` can now send `command` and receive `command_result`.
 
 ## command (host to module)
 - `type`: `command`, `id`: request id (`cmd-N`, at most 64 chars), `module`: module id.
@@ -16,7 +16,13 @@ Status: stage 6.2 (protocol, HTTP), 6.3 (CLI client), 6.4 (path restriction), 6.
 ## Limits
 - At most 16 commands wait for a result per session; more are rejected.
 - At most 16 commands wait in the per-module queue; more give HTTP 429.
-- Pending commands are dropped (the requester gets 502) if the session ends.
+- Pending commands are completed with a failure if the session ends (the HTTP requester gets 502).
+
+## C++ host
+`ModuleHost::sendCommand(name, args, callback)` in `libs/host/module_host.hpp`:
+- The callback runs once with a `CommandOutcome { ok, error }`: the module's `command_result`, or a failure when the command is rejected (module not running, undeclared capability, 16 commands already waiting), the module fails or the host stops. It does not run if the host object is destroyed first, and it must not call back into the host.
+- `pump()` and the internal waits process `command_result` messages; one with an unknown id fails the module.
+- Tests: `tests/host_command_test.cpp` (CTest name `host_command`).
 
 ## HTTP
 - `POST /modules/{id}/start`: 202; 404 unknown module; 409 already running or still stopping.
@@ -57,4 +63,5 @@ orchestrator exec net_analyzer net.analyze --args '{"pcap_paths":["/srv/pcap/cap
 - The `net_analyzer` manifest is still a draft in `modules/net_analyzer/module.json` (needs the `admin` permission); the Rust crate does not modify it.
 
 ## Not done yet
-- Updating `libs/host` (C++) and the message list in the `avscan-protocol` docs.
+- The message type list in the comment of `libs/host/protocol.hpp` and in `docs/MODULES.md` does not mention `command` and `command_result` yet.
+- The C++ host has no HTTP or CLI front end; `sendCommand` is a library call only.
