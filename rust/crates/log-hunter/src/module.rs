@@ -11,14 +11,18 @@
 //! the rules from the start config and answers `command_result`. Every path is
 //! resolved (symlinks included) and must lie inside one of the `command_roots`
 //! directories. Without `command_roots` the directories of the configured
-//! `paths` are used; with neither, the command is refused. Files are analyzed
-//! one after another on the protocol thread, so a large file delays `ping`
-//! answers until it is done.
+//! `paths` are used; with neither, the command is refused. The analysis runs
+//! on a worker thread (at most `MAX_WORKERS` at a time), so `ping` is answered
+//! while it runs. `stop` waits for the analyses that are still running. The
+//! files named in the start config are analyzed before the module serves
+//! requests, so a large one delays the first `ping` answer.
 
 use std::fs::File;
 use std::io::{BufReader, Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+use std::thread::JoinHandle;
 
 use avscan_protocol::{encode_frame, FrameReader, Message, ProtocolError};
 use serde_json::{json, Value};
@@ -35,6 +39,8 @@ pub const LOG_TOPIC: &str = "log_hunter.log";
 pub const CAPABILITIES: [&str; 2] = ["log.hunt", "report.mask_sensitive"];
 const HOST_API: i64 = 1;
 const HUNT_COMMAND: &str = "log.hunt";
+/// How many `log.hunt` analyses may run at the same time.
+const MAX_WORKERS: usize = 4;
 
 /// Errors that end a module session.
 #[derive(Debug, Error)]
@@ -130,7 +136,7 @@ fn reply(msg_type: &str, payload: Value) -> Message {
         .with_payload(payload)
 }
 
-/// Shared, thread-safe frame writer (follower threads publish alerts too).
+/// Shared, thread-safe frame writer (follower and worker threads write too).
 #[derive(Clone)]
 struct Out {
     inner: Arc<Mutex<Box<dyn Write + Send>>>,
@@ -197,14 +203,54 @@ fn recv<R: Read>(input: &mut R, frames: &mut FrameReader) -> Result<Option<Messa
     }
 }
 
-fn command_result(request: &Message, ok: bool, error: Option<&str>) -> Message {
+fn result_message(id: Option<&str>, ok: bool, error: Option<&str>) -> Message {
     let mut payload = json!({ "ok": ok });
     if let Some(text) = error {
         payload["error"] = json!(text);
     }
     let mut result = reply("command_result", payload);
-    result.id = request.id.clone();
+    result.id = id.map(str::to_string);
     result
+}
+
+fn command_result(request: &Message, ok: bool, error: Option<&str>) -> Message {
+    result_message(request.id.as_deref(), ok, error)
+}
+
+/// Worker threads of the running `log.hunt` analyses. Only the protocol
+/// thread starts workers, so the counter needs no compare-and-swap.
+#[derive(Default)]
+struct Workers {
+    handles: Vec<JoinHandle<()>>,
+    active: Arc<AtomicUsize>,
+}
+
+impl Workers {
+    /// Reserves a slot; false when `MAX_WORKERS` analyses are already running.
+    fn try_acquire(&self) -> bool {
+        if self.active.load(Ordering::SeqCst) >= MAX_WORKERS {
+            return false;
+        }
+        self.active.fetch_add(1, Ordering::SeqCst);
+        true
+    }
+
+    /// Runs `job` on a new thread and frees the reserved slot afterwards.
+    fn spawn(&mut self, job: impl FnOnce() + Send + 'static) {
+        self.handles.retain(|handle| !handle.is_finished());
+        let active = Arc::clone(&self.active);
+        self.handles.push(std::thread::spawn(move || {
+            job();
+            active.fetch_sub(1, Ordering::SeqCst);
+        }));
+    }
+
+    /// Waits for every running analysis.
+    fn join_all(&mut self) {
+        for handle in self.handles.drain(..) {
+            let _ = handle.join();
+        }
+    }
 }
 
 /// Resolves every path (following symlinks) and requires it to lie inside one
@@ -229,13 +275,15 @@ fn check_paths(paths: &[PathBuf], roots: &[PathBuf]) -> Result<Vec<PathBuf>, Str
     Ok(checked)
 }
 
-/// Answers one `command`. Unknown commands and bad arguments are reported in
-/// the result (`ok: false`); they do not end the session.
+/// Answers one `command`. Unknown commands and bad arguments are answered at
+/// once with `ok: false`; a valid `log.hunt` is answered by its worker thread
+/// when the analysis is done. Neither ends the session.
 fn handle_command(
     request: &Message,
     out: &Out,
     config: &ModuleConfig,
     sink: &AlertSink,
+    workers: &mut Workers,
 ) -> Result<(), ModuleError> {
     let name = request
         .payload
@@ -258,10 +306,21 @@ fn handle_command(
             return out.send(&command_result(request, false, Some(text.as_str())));
         }
     };
-    for path in &paths {
-        analyze_file(out, path, &config.rules, sink);
+    if !workers.try_acquire() {
+        let text = "too many analyses are running";
+        return out.send(&command_result(request, false, Some(text)));
     }
-    out.send(&command_result(request, true, None))
+    let out = out.clone();
+    let rules = config.rules.clone();
+    let sink = Arc::clone(sink);
+    let id = request.id.clone();
+    workers.spawn(move || {
+        for path in &paths {
+            analyze_file(&out, path, &rules, &sink);
+        }
+        let _ = out.send(&result_message(id.as_deref(), true, None));
+    });
+    Ok(())
 }
 
 enum Exit {
@@ -275,6 +334,7 @@ fn serve<R: Read>(
     out: &Out,
     config: &ModuleConfig,
     sink: &AlertSink,
+    workers: &mut Workers,
 ) -> Result<Exit, ModuleError> {
     while let Some(msg) = recv(input, frames)? {
         match msg.msg_type.as_str() {
@@ -283,7 +343,7 @@ fn serve<R: Read>(
                 pong.id = msg.id.clone();
                 out.send(&pong)?;
             }
-            "command" => handle_command(&msg, out, config, sink)?,
+            "command" => handle_command(&msg, out, config, sink, workers)?,
             "stop" => return Ok(Exit::Stop),
             _ => {}
         }
@@ -339,7 +399,9 @@ pub fn run<R: Read>(mut input: R, output: Box<dyn Write + Send>) -> Result<(), M
         }
     }
 
-    let exit = serve(&mut input, &mut frames, &out, &config, &sink);
+    let mut workers = Workers::default();
+    let exit = serve(&mut input, &mut frames, &out, &config, &sink, &mut workers);
+    workers.join_all();
     drop(followers);
     if matches!(exit?, Exit::Stop) {
         out.send(&reply("stopped", json!({})))?;
@@ -542,6 +604,55 @@ mod tests {
     }
 
     #[test]
+    fn ping_is_answered_while_a_command_is_handled() {
+        let dir = TempDir::new("module_ping_command");
+        let path = burst_log(&dir);
+        let root = dir.path().to_str().unwrap().to_string();
+        let args = json!({ "paths": [path.to_str().unwrap()] });
+        let messages = vec![
+            host_msg("hello", json!({ "host_api": 1 })),
+            host_msg("start", json!({ "config": { "command_roots": [root] } })),
+            command_msg("cmd-1", "log.hunt", args),
+            host_msg("ping", json!({})).with_id("ping-1"),
+            host_msg("stop", json!({})),
+        ];
+        let (result, replies) = run_raw(messages);
+        result.unwrap();
+        let kinds = types(&replies);
+        assert!(kinds.contains(&"pong"));
+        assert_eq!(kinds.last(), Some(&"stopped"));
+        let at = kinds.iter().position(|k| *k == "command_result").unwrap();
+        let events_before = kinds[..at].iter().filter(|k| **k == "event").count();
+        assert_eq!(events_before, 2);
+        assert_eq!(replies[at].id.as_deref(), Some("cmd-1"));
+        assert_eq!(replies[at].payload["ok"], json!(true));
+    }
+
+    #[test]
+    fn the_number_of_running_analyses_is_bounded() {
+        let workers = Workers::default();
+        for _ in 0..MAX_WORKERS {
+            assert!(workers.try_acquire());
+        }
+        assert!(!workers.try_acquire());
+        workers.active.fetch_sub(1, Ordering::SeqCst);
+        assert!(workers.try_acquire());
+    }
+
+    #[test]
+    fn workers_free_their_slot_and_are_joined() {
+        let mut workers = Workers::default();
+        let (tx, rx) = std::sync::mpsc::channel();
+        assert!(workers.try_acquire());
+        workers.spawn(move || {
+            tx.send(7).unwrap();
+        });
+        workers.join_all();
+        assert_eq!(rx.recv().unwrap(), 7);
+        assert_eq!(workers.active.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
     fn log_hunt_command_refuses_paths_outside_the_roots() {
         let allowed = TempDir::new("module_roots_allowed");
         let other = TempDir::new("module_roots_other");
@@ -571,10 +682,7 @@ mod tests {
 
     #[test]
     fn command_roots_default_to_the_directories_of_the_paths() {
-        let paths = [
-            PathBuf::from("/var/log/auth.log"),
-            PathBuf::from("local.log"),
-        ];
+        let paths = [PathBuf::from("/var/log/auth.log"), PathBuf::from("local.log")];
         let roots = command_roots_from(None, &paths);
         assert_eq!(roots, [PathBuf::from("/var/log")]);
         let explicit = json!(["/srv/logs"]);
