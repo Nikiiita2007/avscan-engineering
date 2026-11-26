@@ -14,8 +14,8 @@ use axum::{Json, Router};
 use futures_core::Stream;
 use serde::Serialize;
 use serde_json::{json, Value};
-use tokio::sync::Mutex;
 use tokio::sync::broadcast::error::RecvError;
+use tokio::sync::Mutex;
 
 use crate::supervisor::{ModuleStatus, Orchestrator};
 
@@ -107,7 +107,10 @@ mod tests {
 
     #[tokio::test]
     async fn health_is_json() {
-        let req = Request::builder().uri("/health").body(Body::empty()).unwrap();
+        let req = Request::builder()
+            .uri("/health")
+            .body(Body::empty())
+            .unwrap();
         let response = app().oneshot(req).await.unwrap();
         assert_eq!(response.status(), StatusCode::OK);
         let bytes = to_bytes(response.into_body(), 4096).await.unwrap();
@@ -117,7 +120,10 @@ mod tests {
 
     #[tokio::test]
     async fn modules_can_be_empty() {
-        let req = Request::builder().uri("/modules").body(Body::empty()).unwrap();
+        let req = Request::builder()
+            .uri("/modules")
+            .body(Body::empty())
+            .unwrap();
         let response = app().oneshot(req).await.unwrap();
         let bytes = to_bytes(response.into_body(), 4096).await.unwrap();
         let value: Value = serde_json::from_slice(&bytes).unwrap();
@@ -126,7 +132,10 @@ mod tests {
 
     #[tokio::test]
     async fn events_use_sse_content_type() {
-        let req = Request::builder().uri("/events").body(Body::empty()).unwrap();
+        let req = Request::builder()
+            .uri("/events")
+            .body(Body::empty())
+            .unwrap();
         let response = app().oneshot(req).await.unwrap();
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(response.headers()["content-type"], "text/event-stream");
