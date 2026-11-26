@@ -98,11 +98,7 @@ pub async fn run(command: &Command, token: Option<&str>) -> Result<()> {
             let body = json!({ "name": name, "args": args }).to_string();
             (api.addr, "POST", module_path(id, "command")?, Some(body))
         }
-        Command::Publish {
-            topic,
-            data,
-            api,
-        } => {
+        Command::Publish { topic, data, api } => {
             let data: Value = serde_json::from_str(data).context("--data must be valid JSON")?;
             if !data.is_object() {
                 bail!("--data must be a JSON object");

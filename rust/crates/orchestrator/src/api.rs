@@ -275,9 +275,7 @@ async fn recent(
 ) -> Json<Vec<Value>> {
     let limit = query.limit.unwrap_or(DEFAULT_RECENT).min(HISTORY_LIMIT);
     let events = shared.lock().await.recent(limit);
-    let shown = |event: crate::bus::BusEvent| {
-        json!({"topic": event.topic, "source": event.source, "data": event.data})
-    };
+    let shown = |event: crate::bus::BusEvent| json!({"topic": event.topic, "source": event.source, "data": event.data});
     Json(events.into_iter().map(shown).collect())
 }
 
