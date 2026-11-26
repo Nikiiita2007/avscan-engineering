@@ -1,6 +1,6 @@
 # Protocol: command and command_result
 
-Status: stage 6.2 (protocol, HTTP), 6.3 (CLI client), 6.4 (path restriction), 6.5 (API token), 6.6 (`vuln_scanner`), 6.7 (`net_analyzer`), 6.8 (C++ host), 6.9 (events to modules), 6.10 (Host and Origin guard), 6.11 (capabilities in `GET /modules`) and 6.12 (event history, CLI `publish` and `history`). Both the Rust orchestrator and the C++ `ModuleHost` can send `command` and receive `command_result`.
+Status: stage 6.2 (protocol, HTTP), 6.3 (CLI client), 6.4 (path restriction), 6.5 (API token), 6.6 (`vuln_scanner`), 6.7 (`net_analyzer`), 6.8 (C++ host), 6.9 (events to modules), 6.10 (Host and Origin guard), 6.11 (capabilities in `GET /modules`), 6.12 (event history, CLI `publish` and `history`) and 6.13 (worker threads in `log_hunter` and `net_analyzer`). Both the Rust orchestrator and the C++ `ModuleHost` can send `command` and receive `command_result`.
 
 ## command (host to module)
 - `type`: `command`, `id`: request id (`cmd-N`, at most 64 chars), `module`: module id.
@@ -12,10 +12,12 @@ Status: stage 6.2 (protocol, HTTP), 6.3 (CLI client), 6.4 (path restriction), 6.
 - `payload.ok`: boolean. `payload.error`: optional string.
 - A `command_result` with an unknown id is a protocol violation and fails the session.
 - Progress and findings are published as normal `event` messages on topics the module declares, so they reach SSE.
+- A module may answer later than it receives the next message: `log_hunter` and `net_analyzer` answer a valid command from a worker thread when the analysis is done, and keep answering `ping` meanwhile. The answers of different commands can arrive in any order; the `id` pairs each one with its request.
 
 ## Limits
 - At most 16 commands wait for a result per session; more are rejected.
 - At most 16 commands wait in the per-module queue; more give HTTP 429.
+- A module may run at most 4 analyses at a time (`log_hunter`, `net_analyzer`); the next command is answered with `ok: false` and "too many analyses are running".
 - Pending commands are completed with a failure if the session ends (the HTTP requester gets 502).
 
 ## Events to modules
@@ -85,7 +87,8 @@ orchestrator history --limit 20
 | `net_analyzer` | `net.analyze` | `pcap_paths` | `net_analyzer.alert`, `net_analyzer.log` |
 
 - All three read only inside `command_roots` (module config, list of paths). Paths are resolved with symlinks before the check. Without `command_roots`: `log_hunter` uses the directories of its `paths` (default manifest: `/var/log`), `net_analyzer` the directories of its `pcap_paths`, and `vuln_scanner` its `paths`. With the default manifests of `vuln_scanner` and `net_analyzer` nothing is configured, so the command is refused until `command_roots` or the matching paths are set.
-- All three work on the protocol thread, so a large file or tree delays `ping` answers.
+- `log_hunter` and `net_analyzer` run a command's analysis on a worker thread, so `ping` is answered while it runs; `stop` waits for the analyses that are still running, and the host kills the module if that takes longer than its stop timeout (5 s by default). `vuln_scanner` still works on the protocol thread, so a large tree delays its `ping` answers.
+- The files named in a module's start config are analyzed before the module serves requests, so a large one delays the first `ping` answer in all three modules.
 - The `net_analyzer` manifest is still a draft in `modules/net_analyzer/module.json` (needs the `admin` permission); the Rust crate does not modify it.
 
 ## Not done yet
@@ -93,3 +96,4 @@ orchestrator history --limit 20
 - The C++ host has no HTTP or CLI front end; `sendCommand` is a library call only.
 - The API does not report each module's `command_roots`; see `docs/rust/STAGE9_UX_UI.md`.
 - The three modules have no common finding format; only `rule` and `severity` are confirmed.
+- `vuln_scanner` does not use worker threads yet.
