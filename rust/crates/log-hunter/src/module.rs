@@ -3,9 +3,14 @@
 //! Flow (mirrors `libs/host/module_host.hpp`): `hello` / `hello_ack`, then
 //! `start` with the config / `started`. After that the module analyzes the
 //! configured log files (once, or continuously with `follow`), answers `ping`
-//! and ends on `stop`. Alerts are published as `log_hunter.ioc` events and
-//! progress as `log_hunter.log`. Only protocol frames may be written to the
-//! output; diagnostics go to stderr.
+//! and `command`, and ends on `stop`. Alerts are published as `log_hunter.ioc`
+//! events and progress as `log_hunter.log`. Only protocol frames may be written
+//! to the output; diagnostics go to stderr.
+//!
+//! Command `log.hunt` (args: `paths`, a list of files) analyzes the files with
+//! the rules from the start config and answers `command_result`. Files are
+//! analyzed one after another on the protocol thread, so a large file delays
+//! `ping` answers until it is done.
 
 use std::fs::File;
 use std::io::{BufReader, Read, Write};
@@ -26,6 +31,7 @@ pub const IOC_TOPIC: &str = "log_hunter.ioc";
 pub const LOG_TOPIC: &str = "log_hunter.log";
 pub const CAPABILITIES: [&str; 2] = ["log.hunt", "report.mask_sensitive"];
 const HOST_API: i64 = 1;
+const HUNT_COMMAND: &str = "log.hunt";
 
 /// Errors that end a module session.
 #[derive(Debug, Error)]
@@ -170,12 +176,57 @@ fn recv<R: Read>(input: &mut R, frames: &mut FrameReader) -> Result<Option<Messa
     }
 }
 
+fn command_result(request: &Message, ok: bool, error: Option<&str>) -> Message {
+    let mut payload = json!({ "ok": ok });
+    if let Some(text) = error {
+        payload["error"] = json!(text);
+    }
+    let mut result = reply("command_result", payload);
+    result.id = request.id.clone();
+    result
+}
+
+/// Answers one `command`. Unknown commands and bad arguments are reported in
+/// the result (`ok: false`); they do not end the session.
+fn handle_command(
+    request: &Message,
+    out: &Out,
+    rules: &Rules,
+    sink: &AlertSink,
+) -> Result<(), ModuleError> {
+    let name = request
+        .payload
+        .get("name")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    if name != HUNT_COMMAND {
+        let text = format!("unsupported command '{name}'");
+        return out.send(&command_result(request, false, Some(text.as_str())));
+    }
+    let args = request.payload.get("args");
+    let paths = paths_from(args.and_then(|a| a.get("paths")));
+    if paths.is_empty() {
+        let text = "args.paths must list at least one file";
+        return out.send(&command_result(request, false, Some(text)));
+    }
+    for path in &paths {
+        analyze_file(out, path, rules, sink);
+    }
+    out.send(&command_result(request, true, None))
+}
+
 enum Exit {
     Stop,
     Closed,
 }
 
-fn serve<R: Read>(input: &mut R, frames: &mut FrameReader, out: &Out) -> Result<Exit, ModuleError> {
+fn serve<R: Read>(
+    input: &mut R,
+    frames: &mut FrameReader,
+    out: &Out,
+    rules: &Rules,
+    sink: &AlertSink,
+) -> Result<Exit, ModuleError> {
     while let Some(msg) = recv(input, frames)? {
         match msg.msg_type.as_str() {
             "ping" => {
@@ -183,6 +234,7 @@ fn serve<R: Read>(input: &mut R, frames: &mut FrameReader, out: &Out) -> Result<
                 pong.id = msg.id.clone();
                 out.send(&pong)?;
             }
+            "command" => handle_command(&msg, out, rules, sink)?,
             "stop" => return Ok(Exit::Stop),
             _ => {}
         }
@@ -238,7 +290,7 @@ pub fn run<R: Read>(mut input: R, output: Box<dyn Write + Send>) -> Result<(), M
         }
     }
 
-    let exit = serve(&mut input, &mut frames, &out);
+    let exit = serve(&mut input, &mut frames, &out, &config.rules, &sink);
     drop(followers);
     if matches!(exit?, Exit::Stop) {
         out.send(&reply("stopped", json!({})))?;
@@ -294,6 +346,11 @@ mod tests {
 
     fn host_msg(msg_type: &str, payload: Value) -> Message {
         reply(msg_type, payload)
+    }
+
+    fn command_msg(id: &str, name: &str, args: Value) -> Message {
+        let msg = host_msg("command", json!({ "name": name, "args": args }));
+        msg.with_id(id)
     }
 
     fn frames_of(messages: Vec<Message>) -> Vec<u8> {
@@ -397,6 +454,64 @@ mod tests {
         assert_eq!(replies[2].payload["data"]["rule"], "ssh-bruteforce");
         assert_eq!(replies[3].payload["topic"], LOG_TOPIC);
         assert_eq!(replies[3].payload["data"]["stats"]["lines"], 5);
+    }
+
+    #[test]
+    fn log_hunt_command_analyzes_the_requested_files() {
+        let dir = TempDir::new("module_command");
+        let path = burst_log(&dir);
+        let args = json!({ "paths": [path.to_str().unwrap()] });
+        let messages = vec![
+            host_msg("hello", json!({ "host_api": 1 })),
+            host_msg("start", json!({ "config": {} })),
+            command_msg("cmd-1", "log.hunt", args),
+            host_msg("stop", json!({})),
+        ];
+        let (result, replies) = run_raw(messages);
+        result.unwrap();
+        assert_eq!(
+            types(&replies),
+            [
+                "hello_ack",
+                "started",
+                "event",
+                "event",
+                "command_result",
+                "stopped"
+            ]
+        );
+        assert_eq!(replies[2].payload["data"]["rule"], "ssh-bruteforce");
+        assert_eq!(replies[4].id.as_deref(), Some("cmd-1"));
+        assert_eq!(replies[4].payload["ok"], json!(true));
+    }
+
+    #[test]
+    fn bad_commands_get_error_results() {
+        let messages = vec![
+            host_msg("hello", json!({ "host_api": 1 })),
+            host_msg("start", json!({ "config": {} })),
+            command_msg("cmd-1", "evil", json!({})),
+            command_msg("cmd-2", "log.hunt", json!({})),
+            host_msg("stop", json!({})),
+        ];
+        let (result, replies) = run_raw(messages);
+        result.unwrap();
+        assert_eq!(
+            types(&replies),
+            [
+                "hello_ack",
+                "started",
+                "command_result",
+                "command_result",
+                "stopped"
+            ]
+        );
+        assert_eq!(replies[2].id.as_deref(), Some("cmd-1"));
+        assert_eq!(replies[2].payload["ok"], json!(false));
+        let unsupported = replies[2].payload["error"].as_str().unwrap();
+        assert!(unsupported.contains("unsupported"));
+        assert_eq!(replies[3].id.as_deref(), Some("cmd-2"));
+        assert_eq!(replies[3].payload["ok"], json!(false));
     }
 
     #[test]
