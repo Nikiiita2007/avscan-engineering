@@ -38,16 +38,29 @@ fn parse_response(raw: &[u8]) -> Result<(u16, String)> {
     Ok((status, body.to_string()))
 }
 
+/// Header line for the bearer token; refuses characters that could inject headers.
+fn auth_header(token: Option<&str>) -> Result<String> {
+    let Some(token) = token else {
+        return Ok(String::new());
+    };
+    if token.is_empty() || token.chars().any(|c| c.is_control() || c == ' ') {
+        bail!("the token must not be empty or contain spaces or control characters");
+    }
+    Ok(format!("Authorization: Bearer {token}\r\n"))
+}
+
 /// Sends one request and returns the HTTP status and the response body.
 pub async fn request(
     addr: SocketAddr,
     method: &str,
     path: &str,
     body: Option<&str>,
+    token: Option<&str>,
 ) -> Result<(u16, String)> {
     let body = body.unwrap_or("");
+    let auth = auth_header(token)?;
     let head = format!(
-        "{method} {path} HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\
+        "{method} {path} HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n{auth}\
          Content-Type: application/json\r\nContent-Length: {}\r\n\r\n",
         body.len()
     );
@@ -67,7 +80,7 @@ pub async fn request(
 }
 
 /// Runs a client command, prints the response body and fails on non-2xx.
-pub async fn run(command: &Command) -> Result<()> {
+pub async fn run(command: &Command, token: Option<&str>) -> Result<()> {
     let (addr, method, path, body) = match command {
         Command::Modules { api } => (api.addr, "GET", "/modules".to_string(), None),
         Command::Start { id, api } => (api.addr, "POST", module_path(id, "start")?, None),
@@ -87,7 +100,7 @@ pub async fn run(command: &Command) -> Result<()> {
         }
         Command::Validate | Command::Serve { .. } => bail!("not a client command"),
     };
-    let (status, text) = request(addr, method, &path, body.as_deref()).await?;
+    let (status, text) = request(addr, method, &path, body.as_deref(), token).await?;
     println!("{}", text.trim());
     if !(200..300).contains(&status) {
         bail!("request failed with HTTP {status}");
@@ -104,14 +117,15 @@ mod tests {
     use tokio::net::TcpListener;
     use tokio::sync::Mutex;
 
-    use crate::api::router;
+    use crate::api::router_with_token;
     use crate::supervisor::{Orchestrator, RunOptions};
 
-    async fn serve_empty() -> SocketAddr {
+    async fn serve_empty(token: Option<&str>) -> SocketAddr {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let orchestrator = Orchestrator::start(Vec::new(), RunOptions::default());
-        let app = router(Arc::new(Mutex::new(orchestrator)));
+        let shared = Arc::new(Mutex::new(orchestrator));
+        let app = router_with_token(shared, token.map(str::to_string));
         tokio::spawn(async move {
             let _ = axum::serve(listener, app).await;
         });
@@ -137,16 +151,47 @@ mod tests {
         assert!(parse_response(b"HTTP/1.1 abc\r\n\r\n").is_err());
     }
 
+    #[test]
+    fn token_header_is_built_and_checked() {
+        assert_eq!(auth_header(None).unwrap(), "");
+        let line = auth_header(Some("abc123")).unwrap();
+        assert_eq!(line, "Authorization: Bearer abc123\r\n");
+        for bad in ["", "a b", "a\r\nX-Evil: 1", "tab\there"] {
+            assert!(auth_header(Some(bad)).is_err(), "accepted {bad:?}");
+        }
+    }
+
     #[tokio::test]
     async fn talks_to_a_real_api_server() {
-        let addr = serve_empty().await;
-        let (status, body) = request(addr, "GET", "/health", None).await.unwrap();
+        let addr = serve_empty(None).await;
+        let (status, body) = request(addr, "GET", "/health", None, None)
+            .await
+            .unwrap();
         assert_eq!(status, 200);
         assert!(body.contains("ok"));
-        let (status, _) = request(addr, "POST", "/modules/missing/stop", None)
+        let (status, _) = request(addr, "POST", "/modules/missing/stop", None, None)
             .await
             .unwrap();
         assert_eq!(status, 404);
+    }
+
+    #[tokio::test]
+    async fn token_is_sent_and_enforced() {
+        let token = "0123456789abcdef";
+        let addr = serve_empty(Some(token)).await;
+        let (denied, _) = request(addr, "GET", "/modules", None, None)
+            .await
+            .unwrap();
+        assert_eq!(denied, 401);
+        let (wrong, _) = request(addr, "GET", "/modules", None, Some("wrong-token"))
+            .await
+            .unwrap();
+        assert_eq!(wrong, 401);
+        let (allowed, body) = request(addr, "GET", "/modules", None, Some(token))
+            .await
+            .unwrap();
+        assert_eq!(allowed, 200);
+        assert_eq!(body.trim(), "[]");
     }
 
     #[tokio::test]
@@ -154,6 +199,6 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         drop(listener);
-        assert!(request(addr, "GET", "/health", None).await.is_err());
+        assert!(request(addr, "GET", "/health", None, None).await.is_err());
     }
 }

@@ -5,14 +5,21 @@
 //! `POST /modules/{id}/command` (body: `name`, optional `args`). The command
 //! `name` must be a capability declared by the module. SSE has no replay;
 //! lag is reported explicitly.
+//!
+//! With a token every route except `GET /health` requires the header
+//! `Authorization: Bearer <token>`; without one the API is open to every local
+//! process. The token travels in clear text, which is acceptable on loopback.
 
 use std::convert::Infallible;
 use std::sync::Arc;
 use std::time::Duration;
 
-use axum::extract::{Path, State};
+use axum::extract::{Path, Request, State};
+use axum::http::header::{AUTHORIZATION, WWW_AUTHENTICATE};
 use axum::http::StatusCode;
+use axum::middleware::{self, Next};
 use axum::response::sse::{Event, KeepAlive, Sse};
+use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use futures_core::Stream;
@@ -68,6 +75,40 @@ fn fail(error: ControlError) -> ApiError {
         ControlError::QueueFull => StatusCode::TOO_MANY_REQUESTS,
     };
     (code, Json(json!({"error": error.to_string()})))
+}
+
+/// Compares in time that depends only on the length of the expected token.
+fn same_token(given: &[u8], expected: &[u8]) -> bool {
+    let mut diff = given.len() ^ expected.len();
+    for (i, byte) in expected.iter().enumerate() {
+        let other = given.get(i).copied().unwrap_or(0);
+        diff |= usize::from(byte ^ other);
+    }
+    diff == 0
+}
+
+async fn require_token(
+    State(token): State<Arc<String>>,
+    request: Request,
+    next: Next,
+) -> Response {
+    if request.uri().path() == "/health" {
+        return next.run(request).await;
+    }
+    let given = request
+        .headers()
+        .get(AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "));
+    match given {
+        Some(given) if same_token(given.as_bytes(), token.as_bytes()) => next.run(request).await,
+        _ => (
+            StatusCode::UNAUTHORIZED,
+            [(WWW_AUTHENTICATE, "Bearer")],
+            Json(json!({"error": "missing or invalid bearer token"})),
+        )
+            .into_response(),
+    }
 }
 
 async fn health() -> Json<Value> {
@@ -148,16 +189,29 @@ async fn events(
     Sse::new(stream).keep_alive(keep_alive)
 }
 
-/// SSE is live-only: clients receive events published after subscribing.
+/// The API without authentication.
 pub fn router(shared: Shared) -> Router {
-    Router::new()
+    router_with_token(shared, None)
+}
+
+/// SSE is live-only: clients receive events published after subscribing.
+/// With `Some(token)` every route except `/health` needs that bearer token.
+pub fn router_with_token(shared: Shared, token: Option<String>) -> Router {
+    let app = Router::new()
         .route("/health", get(health))
         .route("/modules", get(modules))
         .route("/modules/{id}/start", post(start))
         .route("/modules/{id}/stop", post(stop))
         .route("/modules/{id}/command", post(command))
         .route("/events", get(events))
-        .with_state(shared)
+        .with_state(shared);
+    match token {
+        Some(token) => {
+            let guard = middleware::from_fn_with_state(Arc::new(token), require_token);
+            app.layer(guard)
+        }
+        None => app,
+    }
 }
 
 #[cfg(test)]
@@ -165,7 +219,6 @@ mod tests {
     use super::*;
 
     use axum::body::{to_bytes, Body};
-    use axum::http::Request;
     use tower::ServiceExt;
 
     use crate::supervisor::RunOptions;
@@ -173,6 +226,23 @@ mod tests {
     fn app() -> Router {
         let orchestrator = Orchestrator::start(Vec::new(), RunOptions::default());
         router(Arc::new(Mutex::new(orchestrator)))
+    }
+
+    fn app_with_token(token: &str) -> Router {
+        let orchestrator = Orchestrator::start(Vec::new(), RunOptions::default());
+        router_with_token(Arc::new(Mutex::new(orchestrator)), Some(token.to_string()))
+    }
+
+    fn get_request(uri: &str, auth: Option<&str>) -> Request<Body> {
+        let mut builder = Request::builder().uri(uri);
+        if let Some(value) = auth {
+            builder = builder.header("authorization", value);
+        }
+        builder.body(Body::empty()).unwrap()
+    }
+
+    async fn status_of(app: Router, request: Request<Body>) -> StatusCode {
+        app.oneshot(request).await.unwrap().status()
     }
 
     #[tokio::test]
@@ -234,6 +304,47 @@ mod tests {
             .unwrap();
         let response = app().oneshot(req).await.unwrap();
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn token_protects_everything_except_health() {
+        let token = "0123456789abcdef";
+        let good_auth = format!("Bearer {token}");
+        let bad_auth = "Bearer wrong-token";
+
+        let open = status_of(app_with_token(token), get_request("/health", None)).await;
+        assert_eq!(open, StatusCode::OK);
+        let none = status_of(app_with_token(token), get_request("/modules", None)).await;
+        assert_eq!(none, StatusCode::UNAUTHORIZED);
+        let bad = get_request("/modules", Some(bad_auth));
+        assert_eq!(
+            status_of(app_with_token(token), bad).await,
+            StatusCode::UNAUTHORIZED
+        );
+        let wrong_scheme = get_request("/modules", Some(token));
+        assert_eq!(
+            status_of(app_with_token(token), wrong_scheme).await,
+            StatusCode::UNAUTHORIZED
+        );
+        let good = get_request("/modules", Some(good_auth.as_str()));
+        assert_eq!(
+            status_of(app_with_token(token), good).await,
+            StatusCode::OK
+        );
+        let events = get_request("/events", None);
+        assert_eq!(
+            status_of(app_with_token(token), events).await,
+            StatusCode::UNAUTHORIZED
+        );
+    }
+
+    #[test]
+    fn tokens_are_compared_exactly() {
+        assert!(same_token(b"secret-token", b"secret-token"));
+        assert!(!same_token(b"secret-token", b"secret-tokeN"));
+        assert!(!same_token(b"secret", b"secret-token"));
+        assert!(!same_token(b"secret-token-and-more", b"secret-token"));
+        assert!(!same_token(b"", b"secret-token"));
     }
 
     #[test]

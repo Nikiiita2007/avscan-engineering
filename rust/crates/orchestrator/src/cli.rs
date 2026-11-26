@@ -10,6 +10,9 @@ use clap::{Args, Parser, Subcommand};
 pub struct Cli {
     #[arg(long, env = "AVSCAN_CONFIG", default_value = "orchestrator.json")]
     pub config: PathBuf,
+    /// Bearer token: required by `serve` clients when set, sent by client commands.
+    #[arg(long, global = true, env = "AVSCAN_TOKEN", hide_env_values = true)]
+    pub token: Option<String>,
     #[command(subcommand)]
     pub command: Command,
 }
@@ -117,5 +120,14 @@ mod tests {
             }
             other => panic!("unexpected command {other:?}"),
         }
+    }
+
+    #[test]
+    fn token_is_global_and_optional() {
+        let plain = Cli::try_parse_from(["orchestrator", "modules"]).unwrap();
+        assert!(plain.token.is_none());
+        let args = ["orchestrator", "modules", "--token", "secret"];
+        let with_token = Cli::try_parse_from(args).unwrap();
+        assert_eq!(with_token.token.as_deref(), Some("secret"));
     }
 }

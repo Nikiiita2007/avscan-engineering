@@ -15,11 +15,14 @@ use avscan_orchestrator::client;
 use avscan_orchestrator::config::Config;
 use avscan_orchestrator::supervisor::{load_specs, Orchestrator, RunOptions};
 
+/// Shorter tokens are too easy to guess; the API is reachable by every local user.
+const MIN_TOKEN_LEN: usize = 16;
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
     if !matches!(cli.command, Command::Validate | Command::Serve { .. }) {
-        return client::run(&cli.command).await;
+        return client::run(&cli.command, cli.token.as_deref()).await;
     }
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
     tracing_subscriber::fmt()
@@ -39,11 +42,15 @@ async fn main() -> Result<()> {
     if !listen.ip().is_loopback() {
         bail!("HTTP API must bind a loopback address");
     }
+    if cli.token.as_deref().is_some_and(|t| t.len() < MIN_TOKEN_LEN) {
+        bail!("the API token must be at least {MIN_TOKEN_LEN} characters");
+    }
     let listener = tokio::net::TcpListener::bind(listen).await?;
-    info!(address = %listener.local_addr()?, "HTTP API listening");
+    let auth = cli.token.is_some();
+    info!(address = %listener.local_addr()?, auth, "HTTP API listening");
     let orchestrator = Orchestrator::start(specs, RunOptions::default());
     let shared = Arc::new(Mutex::new(orchestrator));
-    let app = api::router(Arc::clone(&shared));
+    let app = api::router_with_token(Arc::clone(&shared), cli.token.clone());
     let (stop_tx, stop_rx) = oneshot::channel::<()>();
     let server = axum::serve(listener, app).with_graceful_shutdown(async {
         let _ = stop_rx.await;
