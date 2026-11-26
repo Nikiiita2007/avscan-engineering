@@ -1,25 +1,34 @@
-//! Read-only API and bounded live SSE subscription.
+//! HTTP API: module status, module control and a live SSE subscription.
 //!
-//! The API deliberately permits only loopback binds. Event replay and scan
-//! commands are not implemented in this increment. Lag is reported explicitly.
+//! The API deliberately permits only loopback binds. Control routes:
+//! `POST /modules/{id}/start`, `POST /modules/{id}/stop` and
+//! `POST /modules/{id}/command` (body: `name`, optional `args`). The command
+//! `name` must be a capability declared by the module. SSE has no replay;
+//! lag is reported explicitly.
 
 use std::convert::Infallible;
 use std::sync::Arc;
 use std::time::Duration;
 
-use axum::extract::State;
+use axum::extract::{Path, State};
+use axum::http::StatusCode;
 use axum::response::sse::{Event, KeepAlive, Sse};
-use axum::routing::get;
+use axum::routing::{get, post};
 use axum::{Json, Router};
 use futures_core::Stream;
-use serde::Serialize;
-use serde_json::{json, Value};
+use serde::{Deserialize, Serialize};
+use serde_json::{json, Map, Value};
 use tokio::sync::broadcast::error::RecvError;
 use tokio::sync::Mutex;
 
-use crate::supervisor::{ModuleStatus, Orchestrator};
+use crate::supervisor::{ControlError, ModuleStatus, Orchestrator};
 
 pub type Shared = Arc<Mutex<Orchestrator>>;
+
+/// How long a command request waits for the module's answer.
+const COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
+
+type ApiError = (StatusCode, Json<Value>);
 
 #[derive(Debug, Serialize)]
 struct Status {
@@ -27,6 +36,13 @@ struct Status {
     state: &'static str,
     restart_attempt: Option<u32>,
     error: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CommandRequest {
+    name: String,
+    #[serde(default)]
+    args: Map<String, Value>,
 }
 
 fn status(id: String, value: ModuleStatus) -> Status {
@@ -45,6 +61,15 @@ fn status(id: String, value: ModuleStatus) -> Status {
     }
 }
 
+fn fail(error: ControlError) -> ApiError {
+    let code = match error {
+        ControlError::UnknownModule(_) => StatusCode::NOT_FOUND,
+        ControlError::AlreadyRunning | ControlError::NotRunning => StatusCode::CONFLICT,
+        ControlError::QueueFull => StatusCode::TOO_MANY_REQUESTS,
+    };
+    (code, Json(json!({"error": error.to_string()})))
+}
+
 async fn health() -> Json<Value> {
     Json(json!({"status": "ok"}))
 }
@@ -52,6 +77,51 @@ async fn health() -> Json<Value> {
 async fn modules(State(shared): State<Shared>) -> Json<Vec<Status>> {
     let values = shared.lock().await.statuses();
     Json(values.into_iter().map(|(id, s)| status(id, s)).collect())
+}
+
+async fn start(
+    State(shared): State<Shared>,
+    Path(id): Path<String>,
+) -> Result<(StatusCode, Json<Value>), ApiError> {
+    shared.lock().await.start_module(&id).map_err(fail)?;
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(json!({"module": id, "action": "start"})),
+    ))
+}
+
+async fn stop(
+    State(shared): State<Shared>,
+    Path(id): Path<String>,
+) -> Result<(StatusCode, Json<Value>), ApiError> {
+    shared.lock().await.stop_module(&id).map_err(fail)?;
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(json!({"module": id, "action": "stop"})),
+    ))
+}
+
+async fn command(
+    State(shared): State<Shared>,
+    Path(id): Path<String>,
+    Json(request): Json<CommandRequest>,
+) -> Result<Json<Value>, ApiError> {
+    let queued = shared
+        .lock()
+        .await
+        .command(&id, request.name, request.args);
+    let outcome = queued.map_err(fail)?;
+    match tokio::time::timeout(COMMAND_TIMEOUT, outcome).await {
+        Ok(Ok(result)) => Ok(Json(json!({"ok": result.ok, "error": result.error}))),
+        Ok(Err(_)) => Err((
+            StatusCode::BAD_GATEWAY,
+            Json(json!({"error": "module ended before it answered"})),
+        )),
+        Err(_) => Err((
+            StatusCode::GATEWAY_TIMEOUT,
+            Json(json!({"error": "module did not answer in time"})),
+        )),
+    }
 }
 
 async fn events(
@@ -86,6 +156,9 @@ pub fn router(shared: Shared) -> Router {
     Router::new()
         .route("/health", get(health))
         .route("/modules", get(modules))
+        .route("/modules/{id}/start", post(start))
+        .route("/modules/{id}/stop", post(stop))
+        .route("/modules/{id}/command", post(command))
         .route("/events", get(events))
         .with_state(shared)
 }
@@ -95,7 +168,7 @@ mod tests {
     use super::*;
 
     use axum::body::{to_bytes, Body};
-    use axum::http::{Request, StatusCode};
+    use axum::http::Request;
     use tower::ServiceExt;
 
     use crate::supervisor::RunOptions;
@@ -139,6 +212,31 @@ mod tests {
         let response = app().oneshot(req).await.unwrap();
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(response.headers()["content-type"], "text/event-stream");
+    }
+
+    #[tokio::test]
+    async fn control_of_unknown_module_is_not_found() {
+        for action in ["start", "stop"] {
+            let req = Request::builder()
+                .method("POST")
+                .uri(format!("/modules/missing/{action}"))
+                .body(Body::empty())
+                .unwrap();
+            let response = app().oneshot(req).await.unwrap();
+            assert_eq!(response.status(), StatusCode::NOT_FOUND, "{action}");
+        }
+    }
+
+    #[tokio::test]
+    async fn command_for_unknown_module_is_not_found() {
+        let req = Request::builder()
+            .method("POST")
+            .uri("/modules/missing/command")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"name":"scan.run"}"#))
+            .unwrap();
+        let response = app().oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 
     #[test]

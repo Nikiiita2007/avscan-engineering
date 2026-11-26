@@ -1,5 +1,7 @@
 //! Process supervisor: spawns module executables, runs the handshake and
 //! restarts failed modules according to their manifest restart policy.
+//! Every module has its own stop signal and bounded command queue, so one
+//! module can be started, stopped or commanded independently.
 
 use std::path::PathBuf;
 use std::process::Stdio;
@@ -8,14 +10,19 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use avscan_manifest::{parse_manifest, Manifest, RestartPolicy, HOST_API_VERSION};
 use serde_json::{Map, Value};
+use thiserror::Error;
 use tokio::process::{Child, Command};
-use tokio::sync::{broadcast, watch};
+use tokio::sync::mpsc::error::TrySendError;
+use tokio::sync::{broadcast, mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 use tracing::{error, info, warn};
 
 use crate::bus::{new_bus, BusEvent};
 use crate::config::Config;
-use crate::session::{Connection, Session, SessionEnd, Timeouts};
+use crate::session::{CommandOutcome, Connection, HostCommand, Session, SessionEnd, Timeouts};
+
+/// Commands that may wait for one module before the caller gets `QueueFull`.
+const COMMAND_QUEUE: usize = 16;
 
 /// Lifecycle state of one supervised module.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -25,6 +32,19 @@ pub enum ModuleStatus {
     Restarting { attempt: u32 },
     Stopped,
     Failed(String),
+}
+
+/// Why a control request (start, stop, command) was refused.
+#[derive(Debug, Error, PartialEq, Eq)]
+pub enum ControlError {
+    #[error("unknown module '{0}'")]
+    UnknownModule(String),
+    #[error("module is already running or still stopping")]
+    AlreadyRunning,
+    #[error("module is not running")]
+    NotRunning,
+    #[error("command queue of the module is full")]
+    QueueFull,
 }
 
 /// Everything needed to launch one module.
@@ -120,6 +140,7 @@ async fn run_once(
     bus: &broadcast::Sender<BusEvent>,
     status: &watch::Sender<ModuleStatus>,
     shutdown: &mut watch::Receiver<bool>,
+    commands: &mut mpsc::Receiver<HostCommand>,
     opts: &RunOptions,
 ) -> Outcome {
     let mut child = match spawn(spec) {
@@ -140,7 +161,7 @@ async fn run_once(
         return Outcome::Failed(format!("handshake failed: {e}"));
     }
     let _ = status.send(ModuleStatus::Running);
-    match session.run(shutdown, opts.ping_interval).await {
+    match session.run(shutdown, commands, opts.ping_interval).await {
         SessionEnd::Shutdown { graceful } => {
             let exited = tokio::time::timeout(opts.timeouts.stop, child.wait()).await;
             if !graceful || exited.is_err() {
@@ -156,11 +177,13 @@ async fn run_once(
 }
 
 /// Supervises one module until shutdown or until it fails for good.
+/// Commands queued while the module restarts are delivered after the restart.
 pub async fn run_module(
     spec: ModuleSpec,
     bus: broadcast::Sender<BusEvent>,
     status: watch::Sender<ModuleStatus>,
     mut shutdown: watch::Receiver<bool>,
+    mut commands: mpsc::Receiver<HostCommand>,
     opts: RunOptions,
 ) {
     let id = spec.manifest.id.clone();
@@ -171,7 +194,8 @@ pub async fn run_module(
             return;
         }
         let _ = status.send(ModuleStatus::Starting);
-        match run_once(&spec, &bus, &status, &mut shutdown, &opts).await {
+        let run = run_once(&spec, &bus, &status, &mut shutdown, &mut commands, &opts);
+        match run.await {
             Outcome::Shutdown => {
                 info!(module = %id, "module stopped");
                 let _ = status.send(ModuleStatus::Stopped);
@@ -197,33 +221,58 @@ pub async fn run_module(
     }
 }
 
+/// Control handles of one supervised module.
+struct ModuleEntry {
+    spec: ModuleSpec,
+    status: watch::Receiver<ModuleStatus>,
+    stop: watch::Sender<bool>,
+    commands: mpsc::Sender<HostCommand>,
+    task: Option<JoinHandle<()>>,
+}
+
+impl ModuleEntry {
+    fn is_active(&self) -> bool {
+        self.task.as_ref().is_some_and(|task| !task.is_finished())
+    }
+}
+
+fn launch(spec: ModuleSpec, bus: &broadcast::Sender<BusEvent>, opts: RunOptions) -> ModuleEntry {
+    let (status_tx, status_rx) = watch::channel(ModuleStatus::Starting);
+    let (stop_tx, stop_rx) = watch::channel(false);
+    let (command_tx, command_rx) = mpsc::channel(COMMAND_QUEUE);
+    let task = run_module(
+        spec.clone(),
+        bus.clone(),
+        status_tx,
+        stop_rx,
+        command_rx,
+        opts,
+    );
+    ModuleEntry {
+        spec,
+        status: status_rx,
+        stop: stop_tx,
+        commands: command_tx,
+        task: Some(tokio::spawn(task)),
+    }
+}
+
 /// Owns the supervision tasks of all modules.
 pub struct Orchestrator {
     bus: broadcast::Sender<BusEvent>,
-    shutdown_tx: watch::Sender<bool>,
-    modules: Vec<(String, watch::Receiver<ModuleStatus>)>,
-    tasks: Vec<JoinHandle<()>>,
+    opts: RunOptions,
+    modules: Vec<ModuleEntry>,
 }
 
 impl Orchestrator {
     /// Starts supervising every spec on its own task.
     pub fn start(specs: Vec<ModuleSpec>, opts: RunOptions) -> Self {
         let bus = new_bus();
-        let (shutdown_tx, shutdown_rx) = watch::channel(false);
-        let mut modules = Vec::new();
-        let mut tasks = Vec::new();
-        for spec in specs {
-            let (status_tx, status_rx) = watch::channel(ModuleStatus::Starting);
-            modules.push((spec.manifest.id.clone(), status_rx));
-            let task = run_module(spec, bus.clone(), status_tx, shutdown_rx.clone(), opts);
-            tasks.push(tokio::spawn(task));
-        }
-        Self {
-            bus,
-            shutdown_tx,
-            modules,
-            tasks,
-        }
+        let modules = specs
+            .into_iter()
+            .map(|spec| launch(spec, &bus, opts))
+            .collect();
+        Self { bus, opts, modules }
     }
 
     /// Subscribes to events published by all modules.
@@ -233,16 +282,69 @@ impl Orchestrator {
 
     /// Current status of every module.
     pub fn statuses(&self) -> Vec<(String, ModuleStatus)> {
-        let current =
-            |(id, rx): &(String, watch::Receiver<ModuleStatus>)| (id.clone(), rx.borrow().clone());
+        let current = |m: &ModuleEntry| (m.spec.manifest.id.clone(), m.status.borrow().clone());
         self.modules.iter().map(current).collect()
+    }
+
+    fn entry(&self, id: &str) -> Result<&ModuleEntry, ControlError> {
+        let found = self.modules.iter().find(|m| m.spec.manifest.id == id);
+        found.ok_or_else(|| ControlError::UnknownModule(id.to_string()))
+    }
+
+    fn entry_mut(&mut self, id: &str) -> Result<&mut ModuleEntry, ControlError> {
+        let found = self.modules.iter_mut().find(|m| m.spec.manifest.id == id);
+        found.ok_or_else(|| ControlError::UnknownModule(id.to_string()))
+    }
+
+    /// Starts a module whose supervision task has finished (stopped or failed).
+    pub fn start_module(&mut self, id: &str) -> Result<(), ControlError> {
+        let bus = self.bus.clone();
+        let opts = self.opts;
+        let entry = self.entry_mut(id)?;
+        if entry.is_active() {
+            return Err(ControlError::AlreadyRunning);
+        }
+        let spec = entry.spec.clone();
+        *entry = launch(spec, &bus, opts);
+        Ok(())
+    }
+
+    /// Requests a graceful stop; it does not wait for the module to exit.
+    pub fn stop_module(&mut self, id: &str) -> Result<(), ControlError> {
+        let entry = self.entry_mut(id)?;
+        if !entry.is_active() {
+            return Err(ControlError::NotRunning);
+        }
+        let _ = entry.stop.send(true);
+        Ok(())
+    }
+
+    /// Queues a command for a module. The receiver yields the module's answer.
+    pub fn command(
+        &self,
+        id: &str,
+        name: String,
+        args: Map<String, Value>,
+    ) -> Result<oneshot::Receiver<CommandOutcome>, ControlError> {
+        let entry = self.entry(id)?;
+        let (reply, outcome) = oneshot::channel();
+        let command = HostCommand { name, args, reply };
+        entry.commands.try_send(command).map_err(|e| match e {
+            TrySendError::Full(_) => ControlError::QueueFull,
+            TrySendError::Closed(_) => ControlError::NotRunning,
+        })?;
+        Ok(outcome)
     }
 
     /// Asks every module to stop and waits for the supervision tasks.
     pub async fn shutdown(self) {
-        let _ = self.shutdown_tx.send(true);
-        for task in self.tasks {
-            let _ = task.await;
+        for module in &self.modules {
+            let _ = module.stop.send(true);
+        }
+        for module in self.modules {
+            if let Some(task) = module.task {
+                let _ = task.await;
+            }
         }
     }
 }
@@ -303,7 +405,7 @@ mod tests {
     #[tokio::test]
     async fn missing_binary_fails_without_restart_policy() {
         let orch = Orchestrator::start(vec![spec_for("never", 0)], fast_opts());
-        let mut rx = orch.modules[0].1.clone();
+        let mut rx = orch.modules[0].status.clone();
         let reason = timeout(Duration::from_secs(5), wait_failed(&mut rx))
             .await
             .expect("module did not fail in time")
@@ -315,7 +417,7 @@ mod tests {
     #[tokio::test]
     async fn restarts_are_bounded_by_max_restarts() {
         let orch = Orchestrator::start(vec![spec_for("on_failure", 2)], fast_opts());
-        let mut rx = orch.modules[0].1.clone();
+        let mut rx = orch.modules[0].status.clone();
         let reason = timeout(Duration::from_secs(5), wait_failed(&mut rx))
             .await
             .expect("module did not fail in time")
@@ -334,5 +436,34 @@ mod tests {
         timeout(Duration::from_secs(5), orch.shutdown())
             .await
             .expect("shutdown hung");
+    }
+
+    #[tokio::test]
+    async fn unknown_module_is_reported() {
+        let mut orch = Orchestrator::start(Vec::new(), fast_opts());
+        let missing = ControlError::UnknownModule("nope".to_string());
+        assert_eq!(orch.start_module("nope"), Err(missing.clone()));
+        assert_eq!(orch.stop_module("nope"), Err(missing.clone()));
+        let command = orch.command("nope", "scan.run".to_string(), Map::new());
+        assert_eq!(command.err(), Some(missing));
+    }
+
+    #[tokio::test]
+    async fn stop_module_stops_one_waiting_module() {
+        let mut opts = fast_opts();
+        opts.backoff.base = Duration::from_secs(30);
+        opts.backoff.max = Duration::from_secs(30);
+        let mut orch = Orchestrator::start(vec![spec_for("on_failure", 5)], opts);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        orch.stop_module("ghost_mod").unwrap();
+        let mut rx = orch.modules[0].status.clone();
+        let stopped = timeout(Duration::from_secs(5), async {
+            while *rx.borrow_and_update() != ModuleStatus::Stopped {
+                rx.changed().await.unwrap();
+            }
+        })
+        .await;
+        assert!(stopped.is_ok(), "module did not reach Stopped");
+        orch.shutdown().await;
     }
 }

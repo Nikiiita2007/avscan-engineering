@@ -4,7 +4,13 @@
 //! answers `hello_ack`; the host sends `start` and the module answers
 //! `started`. Afterwards the module streams `event`/`log` messages and
 //! answers `ping` with `pong`.
+//!
+//! The host may also send `command` (payload: `name`, `args`) with a request
+//! `id`; the module answers `command_result` with the same `id` and a payload
+//! `ok` (bool) and optional `error` (string). The command name must be one of
+//! the capabilities declared in the module manifest.
 
+use std::collections::HashMap;
 use std::time::Duration;
 
 use avscan_manifest::{Manifest, HOST_API_VERSION};
@@ -12,11 +18,14 @@ use avscan_protocol::{encode_frame, FrameReader, Message, ProtocolError};
 use serde_json::{json, Map, Value};
 use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio::sync::{broadcast, watch};
+use tokio::sync::{broadcast, mpsc, oneshot, watch};
 use tokio::time::Instant;
 use tracing::{info, warn};
 
 use crate::bus::{topic_allowed, BusEvent};
+
+/// Upper bound of commands waiting for a `command_result` per session.
+const MAX_PENDING_COMMANDS: usize = 16;
 
 /// Errors of one module connection.
 #[derive(Debug, Error)]
@@ -35,6 +44,30 @@ pub enum HostError {
 
 fn violation(msg: impl Into<String>) -> HostError {
     HostError::Violation(msg.into())
+}
+
+/// Result of a command as reported by the module (or by the host on reject).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommandOutcome {
+    pub ok: bool,
+    pub error: Option<String>,
+}
+
+impl CommandOutcome {
+    fn rejected(reason: impl Into<String>) -> Self {
+        Self {
+            ok: false,
+            error: Some(reason.into()),
+        }
+    }
+}
+
+/// A command for one module together with the channel for its outcome.
+#[derive(Debug)]
+pub struct HostCommand {
+    pub name: String,
+    pub args: Map<String, Value>,
+    pub reply: oneshot::Sender<CommandOutcome>,
 }
 
 /// Timeouts of the handshake, stop and liveness checks.
@@ -110,6 +143,7 @@ pub enum SessionEnd {
 
 enum Wake {
     Shutdown,
+    Command(HostCommand),
     Received(Result<Message, HostError>),
 }
 
@@ -121,6 +155,8 @@ pub struct Session<R, W> {
     timeouts: Timeouts,
     running: bool,
     ping_seq: u32,
+    command_seq: u32,
+    pending: HashMap<String, oneshot::Sender<CommandOutcome>>,
     dropped_events: u32,
 }
 
@@ -138,6 +174,8 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> Session<R, W> {
             timeouts,
             running: false,
             ping_seq: 0,
+            command_seq: 0,
+            pending: HashMap::new(),
             dropped_events: 0,
         }
     }
@@ -201,9 +239,11 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> Session<R, W> {
 
     /// Serves the session until shutdown is requested or the module fails.
     /// `idle` is how long to wait for traffic before sending a `ping`.
+    /// Commands arrive through `commands`; a closed queue is not an error.
     pub async fn run(
         &mut self,
         shutdown: &mut watch::Receiver<bool>,
+        commands: &mut mpsc::Receiver<HostCommand>,
         idle: Duration,
     ) -> SessionEnd {
         loop {
@@ -214,6 +254,7 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> Session<R, W> {
             }
             let wake = tokio::select! {
                 _ = shutdown.changed() => Wake::Shutdown,
+                Some(command) = commands.recv() => Wake::Command(command),
                 received = self.conn.recv(idle) => Wake::Received(received),
             };
             match wake {
@@ -221,6 +262,11 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> Session<R, W> {
                     return SessionEnd::Shutdown {
                         graceful: self.stop().await,
                     };
+                }
+                Wake::Command(command) => {
+                    if let Err(e) = self.send_command(command).await {
+                        return SessionEnd::Failed(e.to_string());
+                    }
                 }
                 Wake::Received(Ok(msg)) => {
                     if let Err(e) = self.dispatch(&msg) {
@@ -237,11 +283,35 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> Session<R, W> {
         }
     }
 
+    /// Sends a `command` after checking the declared capabilities and the
+    /// pending limit. Rejections are reported to the caller, not as failures.
+    async fn send_command(&mut self, command: HostCommand) -> Result<(), HostError> {
+        let declared = self.manifest.capabilities.iter().any(|c| *c == command.name);
+        if !declared {
+            let text = format!("module does not declare capability '{}'", command.name);
+            let _ = command.reply.send(CommandOutcome::rejected(text));
+            return Ok(());
+        }
+        if self.pending.len() >= MAX_PENDING_COMMANDS {
+            let text = "too many commands are waiting for a result";
+            let _ = command.reply.send(CommandOutcome::rejected(text));
+            return Ok(());
+        }
+        self.command_seq += 1;
+        let id = format!("cmd-{}", self.command_seq);
+        let payload = json!({ "name": command.name, "args": command.args });
+        let msg = self.base("command").with_id(id.clone()).with_payload(payload);
+        self.conn.send(&msg).await?;
+        self.pending.insert(id, command.reply);
+        Ok(())
+    }
+
     fn dispatch(&mut self, msg: &Message) -> Result<(), HostError> {
         self.check_envelope(msg)?;
         match msg.msg_type.as_str() {
             "event" => self.handle_event(msg),
             "log" => self.handle_log(msg),
+            "command_result" => self.handle_command_result(msg)?,
             "pong" => {}
             "error" => {
                 let text = payload_text(msg, "message");
@@ -276,6 +346,7 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> Session<R, W> {
             match msg.msg_type.as_str() {
                 "log" => self.handle_log(&msg),
                 "event" => self.handle_event(&msg),
+                "command_result" => self.handle_command_result(&msg)?,
                 other if strict => {
                     let text = format!("unexpected '{other}' while waiting for '{ty}'");
                     return Err(violation(text));
@@ -321,6 +392,21 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> Session<R, W> {
     fn handle_log(&self, msg: &Message) {
         let text = payload_text(msg, "message");
         info!(module = %self.manifest.id, message = text, "module log");
+    }
+
+    fn handle_command_result(&mut self, msg: &Message) -> Result<(), HostError> {
+        let Some(reply) = msg.id.as_ref().and_then(|id| self.pending.remove(id)) else {
+            return Err(violation("command_result with an unknown id"));
+        };
+        let ok = msg.payload.get("ok").and_then(Value::as_bool).unwrap_or(false);
+        let error = msg
+            .payload
+            .get("error")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        // The requester may have given up waiting; that is fine.
+        let _ = reply.send(CommandOutcome { ok, error });
+        Ok(())
     }
 
     fn handle_event(&mut self, msg: &Message) {
@@ -488,10 +574,12 @@ mod tests {
         let bus = new_bus();
         let mut events = bus.subscribe();
         let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
+        let (_command_tx, mut command_rx) = mpsc::channel(1);
         let mut session = Session::new(host, manifest(), bus, fast());
         session.start(&Map::new()).await.unwrap();
         let runner = tokio::spawn(async move {
-            let end = session.run(&mut shutdown_rx, Duration::from_secs(1)).await;
+            let idle = Duration::from_secs(1);
+            let end = session.run(&mut shutdown_rx, &mut command_rx, idle).await;
             (end, session.dropped_events())
         });
 
@@ -504,6 +592,83 @@ mod tests {
         let (end, dropped) = timeout(WAIT, runner).await.unwrap().unwrap();
         assert_eq!(end, SessionEnd::Shutdown { graceful: true });
         assert_eq!(dropped, 1);
+    }
+
+    #[tokio::test]
+    async fn command_roundtrip_and_capability_check() {
+        let (host, mut module) = pipe();
+        tokio::spawn(async move {
+            answer_hello(&mut module, reply("hello_ack", good_ack())).await;
+            answer_start(&mut module).await;
+            let command = module.recv(WAIT).await.unwrap();
+            assert_eq!(command.msg_type, "command");
+            assert_eq!(command.payload["name"], "log.hunt");
+            assert_eq!(command.payload["args"]["path"], "/tmp/x");
+            let id = command.id.clone().unwrap();
+            let result = reply("command_result", json!({"ok": true})).with_id(id);
+            module.send(&result).await.unwrap();
+            let stop = module.recv(WAIT).await.unwrap();
+            assert_eq!(stop.msg_type, "stop");
+            module.send(&reply("stopped", json!({}))).await.unwrap();
+        });
+
+        let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
+        let (command_tx, mut command_rx) = mpsc::channel(4);
+        let mut session = Session::new(host, manifest(), new_bus(), fast());
+        session.start(&Map::new()).await.unwrap();
+        let runner = tokio::spawn(async move {
+            let idle = Duration::from_secs(1);
+            session.run(&mut shutdown_rx, &mut command_rx, idle).await
+        });
+
+        let (denied_tx, denied_rx) = oneshot::channel();
+        let denied_command = HostCommand {
+            name: "evil".to_string(),
+            args: Map::new(),
+            reply: denied_tx,
+        };
+        command_tx.send(denied_command).await.unwrap();
+        let denied = timeout(WAIT, denied_rx).await.unwrap().unwrap();
+        assert!(!denied.ok);
+        assert!(denied.error.is_some());
+
+        let mut args = Map::new();
+        args.insert("path".to_string(), json!("/tmp/x"));
+        let (ok_tx, ok_rx) = oneshot::channel();
+        let command = HostCommand {
+            name: "log.hunt".to_string(),
+            args,
+            reply: ok_tx,
+        };
+        command_tx.send(command).await.unwrap();
+        let outcome = timeout(WAIT, ok_rx).await.unwrap().unwrap();
+        assert!(outcome.ok);
+
+        shutdown_tx.send(true).unwrap();
+        let end = timeout(WAIT, runner).await.unwrap().unwrap();
+        assert_eq!(end, SessionEnd::Shutdown { graceful: true });
+    }
+
+    #[tokio::test]
+    async fn unknown_command_result_id_is_a_violation() {
+        let (host, mut module) = pipe();
+        tokio::spawn(async move {
+            answer_hello(&mut module, reply("hello_ack", good_ack())).await;
+            answer_start(&mut module).await;
+            let stray = reply("command_result", json!({"ok": true})).with_id("cmd-99");
+            module.send(&stray).await.unwrap();
+            tokio::time::sleep(Duration::from_millis(300)).await;
+        });
+
+        let (_shutdown_tx, mut shutdown_rx) = watch::channel(false);
+        let (_command_tx, mut command_rx) = mpsc::channel(1);
+        let mut session = Session::new(host, manifest(), new_bus(), fast());
+        session.start(&Map::new()).await.unwrap();
+        let idle = Duration::from_secs(1);
+        let end = timeout(WAIT, session.run(&mut shutdown_rx, &mut command_rx, idle))
+            .await
+            .unwrap();
+        assert!(matches!(end, SessionEnd::Failed(_)));
     }
 
     #[tokio::test]
