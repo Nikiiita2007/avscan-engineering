@@ -9,7 +9,7 @@
   - GET /health, GET /modules, GET /events (SSE, live-only; lagged сообщает о потерянных событиях).
   - POST /modules/{id}/start, POST /modules/{id}/stop, POST /modules/{id}/command.
 - Управление отдельным модулем: у каждого модуля свой сигнал остановки и ограниченная очередь команд (16).
-- Про��окол: сообщения command и command_result, проверка capability по манифесту, не более 16 ожидающих команд на сессию.
+- Протокол: сообщения command и command_result, проверка capability по манифесту, не более 16 ожидающих команд на сессию.
 - Модули log_hunter (log.hunt), vuln_scanner (vuln.scan_files) и net_analyzer (net.analyze) обрабатывают команды и читают файлы только внутри command_roots.
 - Необязательный Bearer-токен: с токеном все маршруты, кроме GET /health, требуют заголовок Authorization.
 - C++ хост (libs/host): ModuleHost::sendCommand и приём command_result, тесты tests/host_command_test.cpp.
@@ -34,7 +34,7 @@ CLI изменён: старый позиционный путь заменён 
 - Согласование транспорта существующего C++ антивируса с его реальной точкой входа.
 - Обновление rust/Cargo.lock: файл в репозитории устарел (в CI добавляются axum, clap, tower и другие зависимости). Нужно выполнить cargo update -w или cargo check локально и закоммитить результат.
 - Модули анализируют файлы в потоке протокола: большой файл задерживает ответы на ping. Нужен отдельный рабочий поток или ограничение размера.
-- Интеграционные тесты есть только для log_hunter; для vuln_scanner и net_analyzer есть тесты на уровне протокола.
+- Интеграционные тесты с настоящим бинарником есть только для log_hunter; для vuln_scanner и net_analyzer есть тесты на уровне протокола.
 - Список типов сообщений в комментарии libs/host/protocol.hpp и в спецификации протокола не упоминает command и command_result.
 - Зелёные fmt, clippy, test, build и cargo check после последнего коммита.
 
