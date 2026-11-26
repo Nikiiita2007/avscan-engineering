@@ -1,6 +1,6 @@
 # Protocol: command and command_result
 
-Status: stage 6.2 (protocol, HTTP), 6.3 (CLI client), 6.4 (path restriction), 6.5 (API token) and 6.6 (`vuln_scanner`). The C++ host does not send or accept these messages yet; mirror them in `libs/host` before relying on them across both hosts.
+Status: stage 6.2 (protocol, HTTP), 6.3 (CLI client), 6.4 (path restriction), 6.5 (API token), 6.6 (`vuln_scanner`) and 6.7 (`net_analyzer`). The C++ host does not send or accept these messages yet; mirror them in `libs/host` before relying on them across both hosts.
 
 ## command (host to module)
 - `type`: `command`, `id`: request id (`cmd-N`, at most 64 chars), `module`: module id.
@@ -42,14 +42,19 @@ orchestrator stop log_hunter
 orchestrator start log_hunter
 orchestrator exec log_hunter log.hunt --args '{"paths":["/var/log/auth.log"]}'
 orchestrator exec vuln_scanner vuln.scan_files --args '{"paths":["/srv/project"]}'
+orchestrator exec net_analyzer net.analyze --args '{"pcap_paths":["/srv/pcap/capture.pcap"]}'
 ```
 
 ## Modules
-- `log_hunter` answers `log.hunt` (args: `paths`). `vuln_scanner` answers `vuln.scan_files` (args: `paths`) and publishes the result as `vuln_scanner.report` before the `command_result`.
-- Both read only inside `command_roots` (module config, list of paths). Paths are resolved with symlinks before the check. Without `command_roots`, `log_hunter` uses the directories of its configured `paths` (default manifest: `/var/log`) and `vuln_scanner` uses its configured `paths` (default manifest: empty, so the command is refused until `command_roots` or `paths` is set).
-- Both modules work on the protocol thread, so a large file or tree delays `ping` answers.
-- `net-analyzer` does not handle `command` yet. Its draft manifest declares `net.analyze`, needs the `admin` permission and is not modified by the Rust crate.
+| Module | Command | Argument | Result events |
+|---|---|---|---|
+| `log_hunter` | `log.hunt` | `paths` | `log_hunter.ioc`, `log_hunter.log` |
+| `vuln_scanner` | `vuln.scan_files` | `paths` | `vuln_scanner.report` |
+| `net_analyzer` | `net.analyze` | `pcap_paths` | `net_analyzer.alert`, `net_analyzer.log` |
+
+- All three read only inside `command_roots` (module config, list of paths). Paths are resolved with symlinks before the check. Without `command_roots`: `log_hunter` uses the directories of its `paths` (default manifest: `/var/log`), `net_analyzer` the directories of its `pcap_paths`, and `vuln_scanner` its `paths`. With the default manifests of `vuln_scanner` and `net_analyzer` nothing is configured, so the command is refused until `command_roots` or the matching paths are set.
+- All three work on the protocol thread, so a large file or tree delays `ping` answers.
+- The `net_analyzer` manifest is still a draft in `modules/net_analyzer/module.json` (needs the `admin` permission); the Rust crate does not modify it.
 
 ## Not done yet
 - Updating `libs/host` (C++) and the message list in the `avscan-protocol` docs.
-- `command` support in `net-analyzer`.

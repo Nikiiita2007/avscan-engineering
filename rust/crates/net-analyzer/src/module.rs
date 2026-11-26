@@ -3,9 +3,17 @@
 //! Flow (mirrors `libs/host/module_host.hpp`): `hello` / `hello_ack`, then
 //! `start` with the config / `started`. After that the module analyzes the
 //! configured pcap files, optionally listens on a loopback port, answers `ping`
-//! and ends on `stop`. Alerts are published as `net_analyzer.alert` events and
-//! progress as `net_analyzer.log`. Only protocol frames may be written to the
-//! output; diagnostics go to stderr.
+//! and `command`, and ends on `stop`. Alerts are published as
+//! `net_analyzer.alert` events and progress as `net_analyzer.log`. Only
+//! protocol frames may be written to the output; diagnostics go to stderr.
+//!
+//! Command `net.analyze` (args: `pcap_paths`, a list of pcap files) analyzes
+//! the files with the rules from the start config and answers
+//! `command_result`. Every path is resolved (symlinks included) and must lie
+//! inside one of the `command_roots` directories. Without `command_roots` the
+//! directories of the configured `pcap_paths` are used; with neither, the
+//! command is refused. Files are analyzed on the protocol thread, so a large
+//! capture delays `ping` answers until it is done.
 
 use std::fs::File;
 use std::io::{BufReader, Read, Write};
@@ -27,6 +35,7 @@ pub const MODULE_ID: &str = "net_analyzer";
 pub const ALERT_TOPIC: &str = "net_analyzer.alert";
 pub const LOG_TOPIC: &str = "net_analyzer.log";
 pub const CAPABILITIES: [&str; 2] = ["net.analyze", "report.mask_sensitive"];
+const ANALYZE_COMMAND: &str = "net.analyze";
 const HOST_API: i64 = 1;
 
 /// Errors that end a module session.
@@ -53,6 +62,8 @@ fn config_error(what: &str, error: &dyn std::fmt::Display) -> ModuleError {
 pub struct ModuleConfig {
     pub mask_secrets: bool,
     pub pcap_paths: Vec<PathBuf>,
+    /// Directories the `net.analyze` command may read from.
+    pub command_roots: Vec<PathBuf>,
     pub listen: Option<SocketAddr>,
     pub rules: Rules,
 }
@@ -68,6 +79,19 @@ fn paths_from(value: Option<&Value>) -> Vec<PathBuf> {
         }
     }
     paths
+}
+
+/// Explicit `command_roots`, or else the directories of the configured paths.
+fn command_roots_from(value: Option<&Value>, paths: &[PathBuf]) -> Vec<PathBuf> {
+    let configured = paths_from(value);
+    if !configured.is_empty() {
+        return configured;
+    }
+    let parents = paths
+        .iter()
+        .filter_map(|p| p.parent())
+        .filter(|p| !p.as_os_str().is_empty());
+    parents.map(Path::to_path_buf).collect()
 }
 
 fn parse_rules(value: Option<&Value>, mask: bool) -> Result<Rules, ModuleError> {
@@ -103,9 +127,12 @@ impl ModuleConfig {
             .get("mask_secrets")
             .and_then(Value::as_bool)
             .unwrap_or(true);
+        let pcap_paths = paths_from(config.get("pcap_paths"));
+        let command_roots = command_roots_from(config.get("command_roots"), &pcap_paths);
         Ok(Self {
             mask_secrets,
-            pcap_paths: paths_from(config.get("pcap_paths")),
+            pcap_paths,
+            command_roots,
             listen: parse_listen(config.get("listen"))?,
             rules: parse_rules(config.get("rules"), mask_secrets)?,
         })
@@ -194,12 +221,85 @@ fn recv<R: Read>(input: &mut R, frames: &mut FrameReader) -> Result<Option<Messa
     }
 }
 
+fn command_result(request: &Message, ok: bool, error: Option<&str>) -> Message {
+    let mut payload = json!({ "ok": ok });
+    if let Some(text) = error {
+        payload["error"] = json!(text);
+    }
+    let mut result = reply("command_result", payload);
+    result.id = request.id.clone();
+    result
+}
+
+/// Resolves every path (following symlinks) and requires it to lie inside one
+/// of the roots. Returns the resolved paths or a message for the requester.
+fn check_paths(paths: &[PathBuf], roots: &[PathBuf]) -> Result<Vec<PathBuf>, String> {
+    let roots: Vec<PathBuf> = roots
+        .iter()
+        .filter_map(|root| std::fs::canonicalize(root).ok())
+        .collect();
+    if roots.is_empty() {
+        return Err("no usable command_roots are configured".to_string());
+    }
+    let mut checked = Vec::new();
+    for path in paths {
+        let real = std::fs::canonicalize(path)
+            .map_err(|e| format!("cannot resolve {}: {e}", path.display()))?;
+        if !roots.iter().any(|root| real.starts_with(root)) {
+            return Err(format!("{} is outside command_roots", path.display()));
+        }
+        checked.push(real);
+    }
+    Ok(checked)
+}
+
+/// Answers one `command`. Unknown commands and bad arguments are reported in
+/// the result (`ok: false`); they do not end the session.
+fn handle_command(
+    request: &Message,
+    out: &Out,
+    config: &ModuleConfig,
+    sink: &AlertSink,
+) -> Result<(), ModuleError> {
+    let name = request
+        .payload
+        .get("name")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    if name != ANALYZE_COMMAND {
+        let text = format!("unsupported command '{name}'");
+        return out.send(&command_result(request, false, Some(text.as_str())));
+    }
+    let args = request.payload.get("args");
+    let requested = paths_from(args.and_then(|a| a.get("pcap_paths")));
+    if requested.is_empty() {
+        let text = "args.pcap_paths must list at least one file";
+        return out.send(&command_result(request, false, Some(text)));
+    }
+    let paths = match check_paths(&requested, &config.command_roots) {
+        Ok(paths) => paths,
+        Err(text) => {
+            return out.send(&command_result(request, false, Some(text.as_str())));
+        }
+    };
+    for path in &paths {
+        analyze_file(out, path, &config.rules, sink);
+    }
+    out.send(&command_result(request, true, None))
+}
+
 enum Exit {
     Stop,
     Closed,
 }
 
-fn serve<R: Read>(input: &mut R, frames: &mut FrameReader, out: &Out) -> Result<Exit, ModuleError> {
+fn serve<R: Read>(
+    input: &mut R,
+    frames: &mut FrameReader,
+    out: &Out,
+    config: &ModuleConfig,
+    sink: &AlertSink,
+) -> Result<Exit, ModuleError> {
     while let Some(msg) = recv(input, frames)? {
         match msg.msg_type.as_str() {
             "ping" => {
@@ -207,6 +307,7 @@ fn serve<R: Read>(input: &mut R, frames: &mut FrameReader, out: &Out) -> Result<
                 pong.id = msg.id.clone();
                 out.send(&pong)?;
             }
+            "command" => handle_command(&msg, out, config, sink)?,
             "stop" => return Ok(Exit::Stop),
             _ => {}
         }
@@ -256,7 +357,7 @@ pub fn run<R: Read>(mut input: R, output: Box<dyn Write + Send>) -> Result<(), M
     }
     let listener = start_listener(&out, &config, &sink);
 
-    let exit = serve(&mut input, &mut frames, &out);
+    let exit = serve(&mut input, &mut frames, &out, &config, &sink);
     drop(listener);
     if matches!(exit?, Exit::Stop) {
         out.send(&reply("stopped", json!({})))?;
@@ -289,6 +390,11 @@ mod tests {
 
     fn host_msg(msg_type: &str, payload: Value) -> Message {
         reply(msg_type, payload)
+    }
+
+    fn command_msg(id: &str, name: &str, args: Value) -> Message {
+        let msg = host_msg("command", json!({ "name": name, "args": args }));
+        msg.with_id(id)
     }
 
     fn frames_of(messages: Vec<Message>) -> Vec<u8> {
@@ -326,6 +432,26 @@ mod tests {
         let (result, replies) = run_raw(messages);
         result.unwrap();
         replies
+    }
+
+    /// Runs hello, start with `config`, one `net.analyze` command and stop.
+    fn analyze_session(config: Value, pcap_paths: Value) -> Vec<Message> {
+        let args = json!({ "pcap_paths": pcap_paths });
+        let messages = vec![
+            host_msg("hello", json!({ "host_api": 1 })),
+            host_msg("start", json!({ "config": config })),
+            command_msg("cmd-1", ANALYZE_COMMAND, args),
+            host_msg("stop", json!({})),
+        ];
+        let (result, replies) = run_raw(messages);
+        result.unwrap();
+        replies
+    }
+
+    fn syn_pcap(dir: &TempDir, name: &str) -> PathBuf {
+        let frame = tcp_frame([10, 0, 0, 1], [10, 0, 0, 2], (5000, 4444), TCP_SYN);
+        dir.write_bytes(name, &pcap_file(LINKTYPE_ETHERNET, &[(1.0, frame)]));
+        dir.path().join(name)
     }
 
     fn types(replies: &[Message]) -> Vec<&str> {
@@ -372,9 +498,7 @@ mod tests {
     #[test]
     fn analyzes_pcap_files_from_the_config() {
         let dir = TempDir::new("module_pcap");
-        let frame = tcp_frame([10, 0, 0, 1], [10, 0, 0, 2], (5000, 4444), TCP_SYN);
-        dir.write_bytes("c2.pcap", &pcap_file(LINKTYPE_ETHERNET, &[(1.0, frame)]));
-        let path = dir.path().join("c2.pcap");
+        let path = syn_pcap(&dir, "c2.pcap");
         let replies = session(json!({ "pcap_paths": [path.to_str().unwrap()] }));
         assert_eq!(
             types(&replies),
@@ -384,6 +508,97 @@ mod tests {
         assert_eq!(replies[2].payload["data"]["rule"], "suspicious-port");
         assert_eq!(replies[3].payload["topic"], LOG_TOPIC);
         assert_eq!(replies[3].payload["data"]["stats"]["packets"], 1);
+    }
+
+    #[test]
+    fn analyze_command_reports_alerts_and_answers() {
+        let dir = TempDir::new("module_command");
+        let path = syn_pcap(&dir, "c2.pcap");
+        let root = dir.path().to_str().unwrap().to_string();
+        let config = json!({ "command_roots": [root] });
+        let replies = analyze_session(config, json!([path.to_str().unwrap()]));
+        assert_eq!(
+            types(&replies),
+            [
+                "hello_ack",
+                "started",
+                "event",
+                "event",
+                "command_result",
+                "stopped"
+            ]
+        );
+        assert_eq!(replies[2].payload["topic"], ALERT_TOPIC);
+        assert_eq!(replies[2].payload["data"]["rule"], "suspicious-port");
+        assert_eq!(replies[4].id.as_deref(), Some("cmd-1"));
+        assert_eq!(replies[4].payload["ok"], json!(true));
+    }
+
+    #[test]
+    fn analyze_command_refuses_paths_outside_the_roots() {
+        let allowed = TempDir::new("module_roots_allowed");
+        let other = TempDir::new("module_roots_other");
+        let outside = syn_pcap(&other, "x.pcap");
+        let root = allowed.path().to_str().unwrap().to_string();
+        let config = json!({ "command_roots": [root] });
+        let replies = analyze_session(config, json!([outside.to_str().unwrap()]));
+        assert_eq!(
+            types(&replies),
+            ["hello_ack", "started", "command_result", "stopped"]
+        );
+        assert_eq!(replies[2].payload["ok"], json!(false));
+        let error = replies[2].payload["error"].as_str().unwrap();
+        assert!(error.contains("outside command_roots"));
+    }
+
+    #[test]
+    fn analyze_command_needs_configured_roots() {
+        let dir = TempDir::new("module_no_roots");
+        let path = syn_pcap(&dir, "x.pcap");
+        let replies = analyze_session(json!({}), json!([path.to_str().unwrap()]));
+        assert_eq!(replies[2].msg_type, "command_result");
+        assert_eq!(replies[2].payload["ok"], json!(false));
+        let error = replies[2].payload["error"].as_str().unwrap();
+        assert!(error.contains("command_roots"));
+    }
+
+    #[test]
+    fn bad_commands_get_error_results() {
+        let messages = vec![
+            host_msg("hello", json!({ "host_api": 1 })),
+            host_msg("start", json!({ "config": {} })),
+            command_msg("cmd-1", "evil", json!({})),
+            command_msg("cmd-2", ANALYZE_COMMAND, json!({})),
+            host_msg("stop", json!({})),
+        ];
+        let (result, replies) = run_raw(messages);
+        result.unwrap();
+        assert_eq!(
+            types(&replies),
+            [
+                "hello_ack",
+                "started",
+                "command_result",
+                "command_result",
+                "stopped"
+            ]
+        );
+        assert_eq!(replies[2].id.as_deref(), Some("cmd-1"));
+        assert_eq!(replies[2].payload["ok"], json!(false));
+        let unsupported = replies[2].payload["error"].as_str().unwrap();
+        assert!(unsupported.contains("unsupported"));
+        assert_eq!(replies[3].id.as_deref(), Some("cmd-2"));
+        assert_eq!(replies[3].payload["ok"], json!(false));
+    }
+
+    #[test]
+    fn command_roots_default_to_the_directories_of_the_paths() {
+        let paths = [PathBuf::from("/srv/pcap/a.pcap"), PathBuf::from("b.pcap")];
+        let roots = command_roots_from(None, &paths);
+        assert_eq!(roots, [PathBuf::from("/srv/pcap")]);
+        let explicit = json!(["/srv/other"]);
+        let roots = command_roots_from(Some(&explicit), &paths);
+        assert_eq!(roots, [PathBuf::from("/srv/other")]);
     }
 
     #[test]
@@ -462,6 +677,7 @@ mod tests {
         let config = ModuleConfig::from_value(&Value::Null).unwrap();
         assert!(config.mask_secrets && config.rules.mask_names);
         assert!(config.pcap_paths.is_empty() && config.listen.is_none());
+        assert!(config.command_roots.is_empty());
         let open = ModuleConfig::from_value(&json!({ "mask_secrets": false })).unwrap();
         assert!(!open.rules.mask_names);
     }
