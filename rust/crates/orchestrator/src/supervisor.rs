@@ -35,7 +35,7 @@ pub enum ModuleStatus {
 }
 
 /// Why a control request (start, stop, command) was refused.
-#[derive(Debug, Error, PartialEq, Eq)]
+#[derive(Debug, Clone, Error, PartialEq, Eq)]
 pub enum ControlError {
     #[error("unknown module '{0}'")]
     UnknownModule(String),

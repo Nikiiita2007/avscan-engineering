@@ -286,7 +286,7 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> Session<R, W> {
     /// Sends a `command` after checking the declared capabilities and the
     /// pending limit. Rejections are reported to the caller, not as failures.
     async fn send_command(&mut self, command: HostCommand) -> Result<(), HostError> {
-        let declared = self.manifest.capabilities.iter().any(|c| *c == command.name);
+        let declared = self.manifest.capabilities.contains(&command.name);
         if !declared {
             let text = format!("module does not declare capability '{}'", command.name);
             let _ = command.reply.send(CommandOutcome::rejected(text));
@@ -300,7 +300,10 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> Session<R, W> {
         self.command_seq += 1;
         let id = format!("cmd-{}", self.command_seq);
         let payload = json!({ "name": command.name, "args": command.args });
-        let msg = self.base("command").with_id(id.clone()).with_payload(payload);
+        let msg = self
+            .base("command")
+            .with_id(id.clone())
+            .with_payload(payload);
         self.conn.send(&msg).await?;
         self.pending.insert(id, command.reply);
         Ok(())
@@ -398,7 +401,11 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> Session<R, W> {
         let Some(reply) = msg.id.as_ref().and_then(|id| self.pending.remove(id)) else {
             return Err(violation("command_result with an unknown id"));
         };
-        let ok = msg.payload.get("ok").and_then(Value::as_bool).unwrap_or(false);
+        let ok = msg
+            .payload
+            .get("ok")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
         let error = msg
             .payload
             .get("error")

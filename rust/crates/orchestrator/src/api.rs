@@ -106,10 +106,7 @@ async fn command(
     Path(id): Path<String>,
     Json(request): Json<CommandRequest>,
 ) -> Result<Json<Value>, ApiError> {
-    let queued = shared
-        .lock()
-        .await
-        .command(&id, request.name, request.args);
+    let queued = shared.lock().await.command(&id, request.name, request.args);
     let outcome = queued.map_err(fail)?;
     match tokio::time::timeout(COMMAND_TIMEOUT, outcome).await {
         Ok(Ok(result)) => Ok(Json(json!({"ok": result.ok, "error": result.error}))),
