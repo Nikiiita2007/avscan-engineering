@@ -54,7 +54,7 @@ impl Rules {
             self.success_after_failures,
             self.repeated_failure_threshold,
         ];
-        if thresholds.iter().any(|t| *t == 0) {
+        if thresholds.contains(&0) {
             return Err("thresholds must be at least 1".to_string());
         }
         for entry in &self.bad_ips {
