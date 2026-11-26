@@ -14,8 +14,10 @@ constexpr std::size_t kMaxFrameBytes = 1u << 20;  // 1 MiB
 
 struct Message {
     int v = kProtocolVersion;
-    std::string type;     // hello, hello_ack, start, started, stop, stopped, ping, pong, event, log, error
-    std::string id;       // optional correlation id (ping/pong)
+    // hello, hello_ack, start, started, stop, stopped, ping, pong, event, log, error,
+    // command (host to module), command_result (module to host)
+    std::string type;
+    std::string id;       // optional correlation id (ping/pong, command/command_result)
     std::string module;   // module id; required on messages that come from a module
     json::Value payload = json::Value::object();
 };
