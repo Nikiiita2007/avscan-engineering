@@ -8,7 +8,9 @@ use std::time::Duration;
 
 use avscan_manifest::{parse_manifest, HOST_API_VERSION};
 use avscan_orchestrator::bus::BusEvent;
-use avscan_orchestrator::supervisor::{ModuleSpec, ModuleStatus, Orchestrator, RunOptions};
+use avscan_orchestrator::supervisor::{
+    ControlError, ModuleSpec, ModuleStatus, Orchestrator, RunOptions,
+};
 use serde_json::{json, Map};
 use tokio::sync::broadcast;
 use tokio::time::{sleep, timeout, Instant};
@@ -30,6 +32,12 @@ fn spec(root: &Path) -> ModuleSpec {
         extra_args: Vec::new(),
         config_override,
     }
+}
+
+fn work_dir(name: &str) -> PathBuf {
+    let dir = std::env::temp_dir().join(format!("{name}-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    dir
 }
 
 async fn wait_for(orch: &Orchestrator, want: ModuleStatus) {
@@ -60,8 +68,7 @@ async fn next_log_event(events: &mut broadcast::Receiver<BusEvent>) -> BusEvent 
 
 #[tokio::test]
 async fn orchestrator_drives_the_real_module() {
-    let dir = std::env::temp_dir().join(format!("avscan-e2e-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
+    let dir = work_dir("avscan-e2e");
     let log = dir.join("auth.log");
     std::fs::write(&log, LOG_LINE).unwrap();
 
@@ -105,6 +112,52 @@ async fn orchestrator_drives_the_real_module() {
         .expect("no answer to the rejected command")
         .expect("module ended before answering");
     assert!(!rejected.ok);
+
+    orch.stop_module(MODULE_ID).unwrap();
+    wait_for(&orch, ModuleStatus::Stopped).await;
+    orch.shutdown().await;
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// More commands than the queue holds: the surplus is refused at once, every
+/// accepted command is answered, and the module keeps working afterwards.
+#[tokio::test]
+async fn a_burst_of_commands_is_bounded_and_answered() {
+    let dir = work_dir("avscan-e2e-load");
+    let log = dir.join("auth.log");
+    std::fs::write(&log, LOG_LINE).unwrap();
+
+    let mut orch = Orchestrator::start(vec![spec(&dir)], RunOptions::default());
+    wait_for(&orch, ModuleStatus::Running).await;
+
+    let mut accepted = Vec::new();
+    let mut refused = 0;
+    for _ in 0..40 {
+        let mut args = Map::new();
+        args.insert("paths".to_string(), json!([log.to_str().unwrap()]));
+        match orch.command(MODULE_ID, "log.hunt".to_string(), args) {
+            Ok(outcome) => accepted.push(outcome),
+            Err(ControlError::QueueFull) => refused += 1,
+            Err(other) => panic!("unexpected error: {other}"),
+        }
+    }
+    assert!(refused > 0, "the command queue never filled up");
+    assert!(!accepted.is_empty());
+    for outcome in accepted {
+        let answer = timeout(WAIT, outcome).await;
+        answer.expect("no answer").expect("module ended");
+    }
+
+    let mut args = Map::new();
+    args.insert("paths".to_string(), json!([log.to_str().unwrap()]));
+    let probe = orch
+        .command(MODULE_ID, "log.hunt".to_string(), args)
+        .unwrap();
+    let probe = timeout(WAIT, probe)
+        .await
+        .expect("the module stopped answering after the burst")
+        .expect("module ended");
+    assert!(probe.ok, "probe failed: {:?}", probe.error);
 
     orch.stop_module(MODULE_ID).unwrap();
     wait_for(&orch, ModuleStatus::Stopped).await;

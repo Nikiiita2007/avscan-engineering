@@ -15,6 +15,10 @@
 //! module never receives its own events. The session subscribes to the bus
 //! when it is created, so events published while the handshake runs are
 //! delivered after the module has started.
+//!
+//! A write that does not finish within the connection's write timeout (a
+//! module that stopped reading its input) fails with `HostError::Timeout`; the
+//! session then fails instead of blocking the supervisor.
 
 use std::collections::HashMap;
 use std::time::Duration;
@@ -33,6 +37,9 @@ use crate::bus::{topic_allowed, BusEvent};
 
 /// Upper bound of commands waiting for a `command_result` per session.
 const MAX_PENDING_COMMANDS: usize = 16;
+
+/// How long one frame may take to be written before the connection is failed.
+pub const DEFAULT_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Errors of one module connection.
 #[derive(Debug, Error)]
@@ -102,6 +109,7 @@ pub struct Connection<R, W> {
     reader: R,
     writer: W,
     frames: FrameReader,
+    write_timeout: Duration,
 }
 
 impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> Connection<R, W> {
@@ -110,14 +118,29 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> Connection<R, W> {
             reader,
             writer,
             frames: FrameReader::new(),
+            write_timeout: DEFAULT_WRITE_TIMEOUT,
         }
     }
 
+    /// Replaces the limit for writing one frame.
+    pub fn with_write_timeout(mut self, write_timeout: Duration) -> Self {
+        self.write_timeout = write_timeout;
+        self
+    }
+
+    /// Writes one frame. After a timeout part of the frame may have been
+    /// written, so the connection must not be used again.
     pub async fn send(&mut self, msg: &Message) -> Result<(), HostError> {
         let frame = encode_frame(msg)?;
-        self.writer.write_all(&frame).await?;
-        self.writer.flush().await?;
-        Ok(())
+        let limit = self.write_timeout;
+        let write = async {
+            self.writer.write_all(&frame).await?;
+            self.writer.flush().await
+        };
+        match tokio::time::timeout(limit, write).await {
+            Ok(result) => Ok(result?),
+            Err(_) => Err(HostError::Timeout),
+        }
     }
 
     /// Receives one message. Cancel-safe: bytes already read stay buffered.
@@ -607,6 +630,17 @@ mod tests {
         let mut session = Session::new(host, manifest(), new_bus(), fast());
         let res = session.start(&Map::new()).await;
         assert!(matches!(res, Err(HostError::Timeout)));
+    }
+
+    #[tokio::test]
+    async fn a_write_that_never_completes_times_out() {
+        let (end, _unread) = tokio::io::duplex(8);
+        let (reader, writer) = tokio::io::split(end);
+        let conn = Connection::new(reader, writer);
+        let mut conn = conn.with_write_timeout(Duration::from_millis(100));
+        let msg = reply("ping", json!({ "padding": "x".repeat(64) }));
+        let result = timeout(WAIT, conn.send(&msg)).await.unwrap();
+        assert!(matches!(result, Err(HostError::Timeout)));
     }
 
     #[tokio::test]

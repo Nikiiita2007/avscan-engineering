@@ -1,9 +1,10 @@
 //! Process supervisor: spawns module executables, runs the handshake and
 //! restarts failed modules according to their manifest restart policy.
 //! Every module has its own stop signal and bounded command queue, so one
-//! module can be started, stopped or commanded independently. The orchestrator
-//! also keeps the most recent bus events, so a client that connects later can
-//! read what it missed (SSE itself has no replay).
+//! module can be started, stopped or commanded independently. A stop request
+//! also interrupts a handshake that is still waiting for the module. The
+//! orchestrator also keeps the most recent bus events, so a client that
+//! connects later can read what it missed (SSE itself has no replay).
 
 use std::collections::VecDeque;
 use std::path::PathBuf;
@@ -15,6 +16,7 @@ use anyhow::{Context, Result};
 use avscan_manifest::{parse_manifest, Manifest, RestartPolicy, HOST_API_VERSION};
 use serde_json::{Map, Value};
 use thiserror::Error;
+use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::process::{Child, Command};
 use tokio::sync::broadcast::error::RecvError;
 use tokio::sync::mpsc::error::TrySendError;
@@ -24,7 +26,9 @@ use tracing::{error, info, warn};
 
 use crate::bus::{new_bus, BusEvent};
 use crate::config::Config;
-use crate::session::{CommandOutcome, Connection, HostCommand, Session, SessionEnd, Timeouts};
+use crate::session::{
+    CommandOutcome, Connection, HostCommand, HostError, Session, SessionEnd, Timeouts,
+};
 
 /// Commands that may wait for one module before the caller gets `QueueFull`.
 const COMMAND_QUEUE: usize = 16;
@@ -156,6 +160,19 @@ fn spawn(spec: &ModuleSpec) -> std::io::Result<Child> {
         .spawn()
 }
 
+/// Runs the handshake unless a stop is requested first. `None` means the stop
+/// won; a closed stop channel counts as a stop request.
+async fn start_unless_stopped<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
+    session: &mut Session<R, W>,
+    overrides: &Map<String, Value>,
+    shutdown: &mut watch::Receiver<bool>,
+) -> Option<Result<(), HostError>> {
+    tokio::select! {
+        result = session.start(overrides) => Some(result),
+        _ = shutdown.changed() => None,
+    }
+}
+
 /// One launch of a module: spawn, handshake, serve until shutdown or failure.
 async fn run_once(
     spec: &ModuleSpec,
@@ -178,9 +195,17 @@ async fn run_once(
     };
     let conn = Connection::new(stdout, stdin);
     let mut session = Session::new(conn, spec.manifest.clone(), bus.clone(), opts.timeouts);
-    if let Err(e) = session.start(&spec.config_override).await {
-        let _ = child.kill().await;
-        return Outcome::Failed(format!("handshake failed: {e}"));
+    let started = start_unless_stopped(&mut session, &spec.config_override, shutdown).await;
+    match started {
+        None => {
+            let _ = child.kill().await;
+            return Outcome::Shutdown;
+        }
+        Some(Err(e)) => {
+            let _ = child.kill().await;
+            return Outcome::Failed(format!("handshake failed: {e}"));
+        }
+        Some(Ok(())) => {}
     }
     let _ = status.send(ModuleStatus::Running);
     match session.run(shutdown, commands, opts.ping_interval).await {
@@ -565,6 +590,27 @@ mod tests {
         .await;
         assert!(stopped.is_ok(), "module did not reach Stopped");
         orch.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn a_stop_interrupts_the_handshake() {
+        let (host_end, _module_end) = tokio::io::duplex(1024);
+        let (reader, writer) = tokio::io::split(host_end);
+        let conn = Connection::new(reader, writer);
+        let manifest = spec_for("never", 0).manifest;
+        let mut session = Session::new(conn, manifest, new_bus(), Timeouts::default());
+        let (stop_tx, mut stop_rx) = watch::channel(false);
+        let stopper = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            stop_tx.send(true).unwrap();
+        });
+        let overrides = Map::new();
+        let handshake = start_unless_stopped(&mut session, &overrides, &mut stop_rx);
+        let outcome = timeout(Duration::from_secs(2), handshake)
+            .await
+            .expect("the handshake was not interrupted");
+        assert!(outcome.is_none());
+        stopper.await.unwrap();
     }
 
     #[tokio::test]

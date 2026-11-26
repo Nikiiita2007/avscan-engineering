@@ -21,3 +21,5 @@ thiserror.workspace = true
 
 [dev-dependencies]
 avscan-manifest.workspace = true
+avscan-orchestrator = { path = "../orchestrator" }
+tokio.workspace = true
