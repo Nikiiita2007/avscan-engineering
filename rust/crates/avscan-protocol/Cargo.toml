@@ -1,0 +1,10 @@
+[package]
+name = "avscan-protocol"
+description = "Framing and message envelope shared with libs/host (C++ module host)"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+serde_json.workspace = true
+thiserror.workspace = true

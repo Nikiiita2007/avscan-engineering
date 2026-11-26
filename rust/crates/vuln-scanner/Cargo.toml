@@ -1,0 +1,26 @@
+[package]
+name = "vuln-scanner"
+description = "Scanner for secrets, vulnerable dependencies and risky Dockerfile practices"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[lib]
+name = "vuln_scanner"
+path = "src/lib.rs"
+
+[[bin]]
+name = "vuln-scanner"
+path = "src/main.rs"
+
+[dependencies]
+avscan-protocol.workspace = true
+regex.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+avscan-manifest.workspace = true
+avscan-orchestrator = { path = "../orchestrator" }
+tokio.workspace = true

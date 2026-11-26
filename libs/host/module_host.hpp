@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <chrono>
 #include <functional>
+#include <map>
 #include <optional>
 #include <string>
 #include <utility>
@@ -72,6 +73,16 @@ struct HostTimeouts {
     std::chrono::milliseconds hello{5000}, start{10000}, stop{5000}, ping{2000};
 };
 
+// Result of a command: the module's command_result, or a rejection or failure reported by the host.
+struct CommandOutcome {
+    bool ok = false;
+    std::string error;
+};
+using CommandCallback = std::function<void(const CommandOutcome&)>;
+
+// At most this many commands may wait for a command_result per module.
+constexpr std::size_t kMaxPendingCommands = 16;
+
 class ModuleHost {
 public:
     ModuleHost(Manifest manifest, Transport& transport, EventBus& bus, HostTimeouts timeouts = {})
@@ -120,6 +131,36 @@ public:
         return true;
     }
 
+    // Sends a `command`. `name` must be a capability declared in the manifest. `done` runs once with the
+    // module's command_result, or with ok == false when the command is rejected here, the module fails or
+    // the host stops (unless the host is destroyed first). Returns true when the command was sent.
+    // `done` must not call back into this host.
+    bool sendCommand(const std::string& name, const json::Value& args, CommandCallback done) {
+        if (state_ != ModuleState::Running) {
+            done(CommandOutcome{false, "module is not running"});
+            return false;
+        }
+        if (std::find(m_.capabilities.begin(), m_.capabilities.end(), name) == m_.capabilities.end()) {
+            done(CommandOutcome{false, "module does not declare capability '" + name + "'"});
+            return false;
+        }
+        if (pending_.size() >= kMaxPendingCommands) {
+            done(CommandOutcome{false, "too many commands are waiting for a result"});
+            return false;
+        }
+        Message c = base("command");
+        c.id = "cmd-" + std::to_string(++commandSeq_);
+        c.payload.set("name", json::Value::string(name));
+        c.payload.set("args", args.isObject() ? args : json::Value::object());
+        if (!t_.send(c)) {
+            done(CommandOutcome{false, "cannot send command"});
+            fail("cannot send command");
+            return false;
+        }
+        pending_.emplace(c.id, std::move(done));
+        return true;
+    }
+
     // Processes everything the module has already sent, without blocking.
     void pump() {
         while (state_ == ModuleState::Running) {
@@ -128,6 +169,7 @@ public:
             if (!checkEnvelope(*m)) return;
             if (m->type == "event") handleEvent(*m);
             else if (m->type == "log") handleLog(*m);
+            else if (m->type == "command_result") { if (!handleCommandResult(*m)) return; }
             else if (m->type == "error") { error_ = "module reported: " + m->payload.getString("message", "(no message)"); }
             else if (m->type == "stopped") { fail("module stopped on its own"); return; }
             else if (m->type == "pong") continue;
@@ -160,6 +202,7 @@ public:
             t_.terminate();
         }
         state_ = ModuleState::Stopped;
+        cancelPending("module stopped");
     }
 
 private:
@@ -174,6 +217,7 @@ private:
         error_ = std::move(msg);
         state_ = ModuleState::Failed;
         unsubscribeAll();
+        cancelPending("module failed: " + error_);
         t_.terminate();
         return false;
     }
@@ -181,6 +225,13 @@ private:
     void unsubscribeAll() {
         for (int id : subIds_) bus_.unsubscribe(id);
         subIds_.clear();
+    }
+
+    // Completes every waiting command with a failure. The callbacks run after the table is emptied.
+    void cancelPending(const std::string& reason) {
+        std::map<std::string, CommandCallback> waiting;
+        waiting.swap(pending_);
+        for (auto& entry : waiting) entry.second(CommandOutcome{false, reason});
     }
 
     bool checkEnvelope(const Message& m) {
@@ -206,6 +257,20 @@ private:
         if (logSink_) logSink_(m_.id + ": " + m.payload.getString("message"));
     }
 
+    // A command_result must answer a waiting command; anything else is a protocol violation.
+    bool handleCommandResult(const Message& m) {
+        auto it = pending_.find(m.id);
+        if (it == pending_.end()) return fail("command_result with an unknown id");
+        CommandCallback done = std::move(it->second);
+        pending_.erase(it);
+        CommandOutcome outcome;
+        const json::Value* ok = m.payload.find("ok");
+        outcome.ok = ok && ok->isBool() && ok->b;
+        outcome.error = m.payload.getString("error");
+        done(outcome);
+        return true;
+    }
+
     void handleEvent(const Message& m) {
         const std::string topic = m.payload.getString("topic");
         if (topic.empty() || !topicAllowed(m_.publishes, topic)) {
@@ -217,7 +282,7 @@ private:
         bus_.publish(topic, data ? *data : json::Value::object(), m_.id);
     }
 
-    // Waits for a message of the given type. Events and logs that arrive meanwhile are processed.
+    // Waits for a message of the given type. Events, logs and command results that arrive meanwhile are processed.
     std::optional<Message> expect(const char* type, std::chrono::milliseconds timeout, bool failOnTimeout) {
         const auto deadline = std::chrono::steady_clock::now() + timeout;
         for (;;) {
@@ -232,6 +297,10 @@ private:
             if (m->type == type) return m;
             if (m->type == "log") { handleLog(*m); continue; }
             if (m->type == "event") { if (state_ == ModuleState::Running || state_ == ModuleState::Stopping) handleEvent(*m); continue; }
+            if (m->type == "command_result") {
+                if (!handleCommandResult(*m)) return std::nullopt;
+                continue;
+            }
             if (failOnTimeout) fail("unexpected message '" + m->type + "' while waiting for '" + type + "'");
             else continue;  // while stopping, ignore stragglers and keep waiting for "stopped"
             return std::nullopt;
@@ -247,6 +316,8 @@ private:
     bool forced_ = false;
     unsigned dropped_ = 0;
     unsigned pingSeq_ = 0;
+    unsigned commandSeq_ = 0;
+    std::map<std::string, CommandCallback> pending_;
     std::vector<int> subIds_;
     std::function<void(const std::string&)> logSink_;
 };
