@@ -98,7 +98,10 @@ fn follow_loop(job: &Job, stop: &AtomicBool) {
             Err(e) => {
                 if !failing {
                     failing = true;
-                    say(&job.notify, &format!("cannot read {}: {e}", job.path.display()));
+                    say(
+                        &job.notify,
+                        &format!("cannot read {}: {e}", job.path.display()),
+                    );
                 }
             }
         }
@@ -175,7 +178,9 @@ mod tests {
         append(&path, "o\nthree\n");
         let lines = read_new(&path, &mut offset, &mut pending).unwrap();
         assert_eq!(lines, ["two", "three"]);
-        assert!(read_new(&path, &mut offset, &mut pending).unwrap().is_empty());
+        assert!(read_new(&path, &mut offset, &mut pending)
+            .unwrap()
+            .is_empty());
     }
 
     #[test]
@@ -195,19 +200,28 @@ mod tests {
     fn read_new_reports_missing_files() {
         let mut offset = 0;
         let mut pending = Vec::new();
-        let result = read_new(Path::new("definitely/missing.log"), &mut offset, &mut pending);
+        let result = read_new(
+            Path::new("definitely/missing.log"),
+            &mut offset,
+            &mut pending,
+        );
         assert!(result.is_err());
     }
 
     #[test]
     fn follower_alerts_on_lines_appended_later() {
         let dir = TempDir::new("follow_live");
-        dir.write("auth.log", &(failed(0, 0, "203.0.113.5", "root") + &failed(0, 1, "203.0.113.5", "root")));
+        dir.write(
+            "auth.log",
+            &(failed(0, 0, "203.0.113.5", "root") + &failed(0, 1, "203.0.113.5", "root")),
+        );
         let path = dir.path().join("auth.log");
         let (sink, rx) = channel_sink();
         let mut follower = Follower::start(path.clone(), Rules::default(), sink, silent());
         thread::sleep(Duration::from_millis(300));
-        let more: String = (2..5).map(|s| failed(0, s, "203.0.113.5", "root")).collect();
+        let more: String = (2..5)
+            .map(|s| failed(0, s, "203.0.113.5", "root"))
+            .collect();
         append(&path, &more);
         let alert = rx.recv_timeout(Duration::from_secs(5)).unwrap();
         assert_eq!(alert.rule, "ssh-bruteforce");
