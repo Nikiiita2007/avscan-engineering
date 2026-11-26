@@ -1,6 +1,6 @@
 # Protocol: command and command_result
 
-Status: stage 6.2 (protocol, HTTP), 6.3 (CLI client), 6.4 (path restriction), 6.5 (API token), 6.6 (`vuln_scanner`), 6.7 (`net_analyzer`), 6.8 (C++ host) and 6.9 (events to modules). Both the Rust orchestrator and the C++ `ModuleHost` can send `command` and receive `command_result`.
+Status: stage 6.2 (protocol, HTTP), 6.3 (CLI client), 6.4 (path restriction), 6.5 (API token), 6.6 (`vuln_scanner`), 6.7 (`net_analyzer`), 6.8 (C++ host), 6.9 (events to modules), 6.10 (Host and Origin guard) and 6.11 (capabilities in `GET /modules`). Both the Rust orchestrator and the C++ `ModuleHost` can send `command` and receive `command_result`.
 
 ## command (host to module)
 - `type`: `command`, `id`: request id (`cmd-N`, at most 64 chars), `module`: module id.
@@ -34,10 +34,19 @@ curl -X POST http://127.0.0.1:8787/events -H "Authorization: Bearer $AVSCAN_TOKE
 - Tests: `tests/host_command_test.cpp` (CTest name `host_command`).
 
 ## HTTP
+- `GET /health`: `{"status":"ok"}`; the only route that needs no token.
+- `GET /modules`: a list of `{id, state, restart_attempt, error, capabilities}`. `state` is `starting`, `running`, `restarting`, `stopped` or `failed`; `restart_attempt` is set while restarting; `error` is the reason of a failure; `capabilities` are the names from the manifest and are the valid command names.
+- `GET /events`: Server-Sent Events, live only. Event `module_event` carries `{topic, source, data}`; event `lagged` carries `{dropped}`; a keep-alive comment arrives every 15 s.
 - `POST /modules/{id}/start`: 202; 404 unknown module; 409 already running or still stopping.
 - `POST /modules/{id}/stop`: 202, does not wait for exit; 404; 409 not running.
 - `POST /modules/{id}/command` with `{"name":"...","args":{}}`: 200 with `{ok,error}` when the module answers; 404; 409; 429; 502 if the module ended; 504 after 30 s.
 - `POST /events`: 202; 400 for an invalid topic or non-object data.
+
+## Requests from web pages
+Every route refuses requests that a web page could send, with 403, before the token is checked:
+- A `Host` header that is not `127.0.0.1`, `localhost` or `[::1]` (with any port) is a DNS rebinding attempt.
+- An `Origin` header must be exactly `http://` plus the `Host` value; a different address or port, `https://` and `null` are refused. Browsers send `Origin` on cross-site requests, so a foreign page cannot call the API.
+- Clients that send no `Origin`, such as curl and the CLI, are not affected. This does not replace the token: without a token every local program can still control the modules.
 
 ## Authentication
 - Start the server with a token: `AVSCAN_TOKEN=<at least 16 characters> orchestrator serve` (or `--token`). Every route except `GET /health` then needs `Authorization: Bearer <token>`; otherwise the server answers 401.
@@ -75,3 +84,4 @@ orchestrator exec net_analyzer net.analyze --args '{"pcap_paths":["/srv/pcap/cap
 ## Not done yet
 - The message type list in the comment of `libs/host/protocol.hpp` and in the protocol specification does not mention `command` and `command_result` yet.
 - The C++ host has no HTTP or CLI front end; `sendCommand` is a library call only.
+- The API does not report each module's `command_roots`; see `docs/rust/STAGE9_UX_UI.md`.
