@@ -42,10 +42,7 @@ impl From<ProtocolError> for KitError {
 }
 
 /// Next message, or `None` when the input is closed.
-pub fn recv<R: Read>(
-    input: &mut R,
-    frames: &mut FrameReader,
-) -> Result<Option<Message>, KitError> {
+pub fn recv<R: Read>(input: &mut R, frames: &mut FrameReader) -> Result<Option<Message>, KitError> {
     let mut buf = [0u8; 4096];
     loop {
         if let Some(msg) = frames.next_message()? {
@@ -192,7 +189,10 @@ mod tests {
         let mut bytes = Vec::new();
         bytes.extend(encode_frame(&first).unwrap());
         bytes.extend(encode_frame(&second).unwrap());
-        let mut input = Chunked { data: bytes, step: 3 };
+        let mut input = Chunked {
+            data: bytes,
+            step: 3,
+        };
         let mut frames = FrameReader::new();
         let a = recv(&mut input, &mut frames).unwrap().unwrap();
         assert_eq!(a.msg_type, "ping");
