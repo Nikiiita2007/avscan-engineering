@@ -12,7 +12,11 @@ pub fn paths_from(value: Option<&Value>) -> Vec<PathBuf> {
     let Some(items) = value.and_then(Value::as_array) else {
         return Vec::new();
     };
-    items.iter().filter_map(Value::as_str).map(PathBuf::from).collect()
+    items
+        .iter()
+        .filter_map(Value::as_str)
+        .map(PathBuf::from)
+        .collect()
 }
 
 /// Resolve paths and require component-wise containment in a usable root.
@@ -57,7 +61,10 @@ mod tests {
     #[test]
     fn paths_ignore_non_strings() {
         let input = json!(["a", 1, null, "b"]);
-        assert_eq!(paths_from(Some(&input)), vec![PathBuf::from("a"), PathBuf::from("b")]);
+        assert_eq!(
+            paths_from(Some(&input)),
+            vec![PathBuf::from("a"), PathBuf::from("b")]
+        );
         assert!(paths_from(None).is_empty());
         assert!(paths_from(Some(&json!({}))).is_empty());
     }
@@ -79,9 +86,9 @@ mod tests {
     fn containment_uses_path_components() {
         let current = std::env::current_dir().unwrap();
         let roots = vec![current.clone()];
-        let checked = check_paths(&[current.clone()], &roots).unwrap();
+        let checked = check_paths(std::slice::from_ref(&current), &roots).unwrap();
         assert_eq!(checked, vec![std::fs::canonicalize(&current).unwrap()]);
-        assert!(check_paths(&[current.clone()], &[]).is_err());
+        assert!(check_paths(std::slice::from_ref(&current), &[]).is_err());
         if let Some(parent) = current.parent() {
             assert!(check_paths(&[parent.to_path_buf()], &roots).is_err());
         }

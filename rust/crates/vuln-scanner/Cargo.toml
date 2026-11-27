@@ -14,6 +14,7 @@ name = "vuln-scanner"
 path = "src/main.rs"
 
 [dependencies]
+avscan-module-kit.workspace = true
 avscan-protocol.workspace = true
 regex.workspace = true
 serde.workspace = true

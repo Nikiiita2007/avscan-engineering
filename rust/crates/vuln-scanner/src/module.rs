@@ -26,6 +26,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
 use std::thread::Scope;
 
+use avscan_module_kit::{check_paths, paths_from};
 use avscan_protocol::{encode_frame, FrameReader, Message, ProtocolError};
 use serde_json::{json, Value};
 use thiserror::Error;
@@ -63,19 +64,6 @@ pub struct ModuleConfig {
     /// Directories or files that commands and scan events may read.
     pub command_roots: Vec<PathBuf>,
     pub options: ScanOptions,
-}
-
-fn paths_from(value: Option<&Value>) -> Vec<PathBuf> {
-    let Some(items) = value.and_then(Value::as_array) else {
-        return Vec::new();
-    };
-    let mut paths = Vec::new();
-    for item in items {
-        if let Some(path) = item.as_str() {
-            paths.push(PathBuf::from(path));
-        }
-    }
-    paths
 }
 
 /// Explicit `command_roots`, or else the configured scan paths.
@@ -178,36 +166,8 @@ fn publish_scan<W: Write>(
     }
 }
 
-/// Resolves every path (following symlinks) and requires it to lie inside one
-/// of the roots. Returns the resolved paths or a message for the requester.
-fn check_paths(paths: &[PathBuf], roots: &[PathBuf]) -> Result<Vec<PathBuf>, String> {
-    let roots: Vec<PathBuf> = roots
-        .iter()
-        .filter_map(|root| std::fs::canonicalize(root).ok())
-        .collect();
-    if roots.is_empty() {
-        return Err("no usable command_roots are configured".to_string());
-    }
-    let mut checked = Vec::new();
-    for path in paths {
-        let real = std::fs::canonicalize(path)
-            .map_err(|e| format!("cannot resolve {}: {e}", path.display()))?;
-        if !roots.iter().any(|root| real.starts_with(root)) {
-            return Err(format!("{} is outside command_roots", path.display()));
-        }
-        checked.push(real);
-    }
-    Ok(checked)
-}
-
 fn result_message(id: Option<&str>, ok: bool, error: Option<&str>) -> Message {
-    let mut payload = json!({ "ok": ok });
-    if let Some(text) = error {
-        payload["error"] = json!(text);
-    }
-    let mut result = reply("command_result", payload);
-    result.id = id.map(str::to_string);
-    result
+    avscan_module_kit::result_message(MODULE_ID, id, ok, error)
 }
 
 fn command_result(request: &Message, ok: bool, error: Option<&str>) -> Message {

@@ -26,6 +26,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
+use avscan_module_kit::{check_paths, paths_from};
 use avscan_protocol::{encode_frame, FrameReader, Message, ProtocolError};
 use serde_json::{json, Value};
 use thiserror::Error;
@@ -73,19 +74,6 @@ pub struct ModuleConfig {
     pub command_roots: Vec<PathBuf>,
     pub listen: Option<SocketAddr>,
     pub rules: Rules,
-}
-
-fn paths_from(value: Option<&Value>) -> Vec<PathBuf> {
-    let Some(items) = value.and_then(Value::as_array) else {
-        return Vec::new();
-    };
-    let mut paths = Vec::new();
-    for item in items {
-        if let Some(path) = item.as_str() {
-            paths.push(PathBuf::from(path));
-        }
-    }
-    paths
 }
 
 /// Explicit `command_roots`, or else the directories of the configured paths.
@@ -229,13 +217,7 @@ fn recv<R: Read>(input: &mut R, frames: &mut FrameReader) -> Result<Option<Messa
 }
 
 fn result_message(id: Option<&str>, ok: bool, error: Option<&str>) -> Message {
-    let mut payload = json!({ "ok": ok });
-    if let Some(text) = error {
-        payload["error"] = json!(text);
-    }
-    let mut result = reply("command_result", payload);
-    result.id = id.map(str::to_string);
-    result
+    avscan_module_kit::result_message(MODULE_ID, id, ok, error)
 }
 
 fn command_result(request: &Message, ok: bool, error: Option<&str>) -> Message {
@@ -276,28 +258,6 @@ impl Workers {
             let _ = handle.join();
         }
     }
-}
-
-/// Resolves every path (following symlinks) and requires it to lie inside one
-/// of the roots. Returns the resolved paths or a message for the requester.
-fn check_paths(paths: &[PathBuf], roots: &[PathBuf]) -> Result<Vec<PathBuf>, String> {
-    let roots: Vec<PathBuf> = roots
-        .iter()
-        .filter_map(|root| std::fs::canonicalize(root).ok())
-        .collect();
-    if roots.is_empty() {
-        return Err("no usable command_roots are configured".to_string());
-    }
-    let mut checked = Vec::new();
-    for path in paths {
-        let real = std::fs::canonicalize(path)
-            .map_err(|e| format!("cannot resolve {}: {e}", path.display()))?;
-        if !roots.iter().any(|root| real.starts_with(root)) {
-            return Err(format!("{} is outside command_roots", path.display()));
-        }
-        checked.push(real);
-    }
-    Ok(checked)
 }
 
 /// Answers one `command`. Unknown commands and bad arguments are answered at
