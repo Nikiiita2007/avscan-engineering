@@ -1,6 +1,12 @@
-//! Shared module helpers. Transport and worker management remain module-local.
+//! Shared module helpers: path checks, `command_result` messages, frame input,
+//! a shared frame writer and a bounded worker pool. The protocol flow and the
+//! command handlers remain module-local.
 //! Path checks preserve current module behavior, not a filesystem sandbox:
 //! canonicalization followed by a later open has a race with filesystem changes.
+
+mod runtime;
+
+pub use runtime::{recv, KitError, Out, Workers};
 
 use std::path::PathBuf;
 
