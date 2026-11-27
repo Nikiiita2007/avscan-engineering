@@ -1,0 +1,20 @@
+{
+  "listen": "127.0.0.1:8787",
+  "modules": [
+    {
+      "manifest": "rust/modules/log_hunter/module.json",
+      "binary": "rust/target/debug/log-hunter",
+      "config": { "paths": [], "command_roots": ["/var/log"] }
+    },
+    {
+      "manifest": "rust/modules/vuln_scanner/module.json",
+      "binary": "rust/target/debug/vuln-scanner",
+      "config": { "command_roots": ["/srv/projects"] }
+    },
+    {
+      "manifest": "modules/net_analyzer/module.json",
+      "binary": "rust/target/debug/net-analyzer",
+      "config": { "command_roots": ["/srv/pcap"] }
+    }
+  ]
+}

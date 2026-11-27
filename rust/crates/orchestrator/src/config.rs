@@ -5,6 +5,7 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
+use serde_json::{Map, Value};
 use thiserror::Error;
 
 pub const DEFAULT_LISTEN: &str = "127.0.0.1:8787";
@@ -36,6 +37,10 @@ pub struct ModuleEntry {
     /// Extra command-line arguments appended after the manifest arguments.
     #[serde(default)]
     pub args: Vec<String>,
+    /// Module settings sent in `start`. Keys given here replace the keys of
+    /// the manifest `config`, for example `command_roots`.
+    #[serde(default)]
+    pub config: Map<String, Value>,
 }
 
 /// Top-level orchestrator configuration.
@@ -132,6 +137,18 @@ mod tests {
         assert_eq!(cfg.modules.len(), 1);
         assert!(cfg.modules[0].enabled);
         assert!(cfg.modules[0].args.is_empty());
+    }
+
+    #[test]
+    fn module_settings_are_parsed() {
+        let text = r#"{"modules": [
+            {"manifest": "a.json", "binary": "a", "config": {"command_roots": ["/srv"]}}
+        ]}"#;
+        let cfg = Config::from_json_str(text).unwrap();
+        assert_eq!(cfg.modules[0].config["command_roots"][0], "/srv");
+        let text = r#"{"modules": [{"manifest": "b.json", "binary": "b"}]}"#;
+        let plain = Config::from_json_str(text).unwrap();
+        assert!(plain.modules[0].config.is_empty());
     }
 
     #[test]
