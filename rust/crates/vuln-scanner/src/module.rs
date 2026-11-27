@@ -57,6 +57,17 @@ pub enum ModuleError {
     Poisoned,
 }
 
+impl From<avscan_module_kit::KitError> for ModuleError {
+    fn from(error: avscan_module_kit::KitError) -> Self {
+        use avscan_module_kit::KitError;
+        match error {
+            KitError::Io(e) => Self::Io(e),
+            KitError::Protocol(e) => Self::Protocol(e),
+            KitError::Poisoned => Self::Poisoned,
+        }
+    }
+}
+
 /// Module configuration taken from the `start` message.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ModuleConfig {
@@ -127,17 +138,7 @@ impl<W: Write> Out<W> {
 
 /// Next message, or `None` when the host closed the input.
 fn recv<R: Read>(input: &mut R, frames: &mut FrameReader) -> Result<Option<Message>, ModuleError> {
-    let mut buf = [0u8; 4096];
-    loop {
-        if let Some(msg) = frames.next_message()? {
-            return Ok(Some(msg));
-        }
-        let n = input.read(&mut buf)?;
-        if n == 0 {
-            return Ok(None);
-        }
-        frames.feed(&buf[..n]);
-    }
+    Ok(avscan_module_kit::recv(input, frames)?)
 }
 
 fn report_event(report: &crate::report::Report) -> Result<Message, ModuleError> {

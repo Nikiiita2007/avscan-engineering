@@ -22,12 +22,10 @@ use std::fs::File;
 use std::io::{BufReader, Read, Write};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
-use std::thread::JoinHandle;
+use std::sync::Arc;
 
-use avscan_module_kit::{check_paths, paths_from};
-use avscan_protocol::{encode_frame, FrameReader, Message, ProtocolError};
+use avscan_module_kit::{check_paths, paths_from, Workers};
+use avscan_protocol::{FrameReader, Message, ProtocolError};
 use serde_json::{json, Value};
 use thiserror::Error;
 
@@ -59,6 +57,17 @@ pub enum ModuleError {
     Config(String),
     #[error("output lock poisoned")]
     Poisoned,
+}
+
+impl From<avscan_module_kit::KitError> for ModuleError {
+    fn from(error: avscan_module_kit::KitError) -> Self {
+        use avscan_module_kit::KitError;
+        match error {
+            KitError::Io(e) => Self::Io(e),
+            KitError::Protocol(e) => Self::Protocol(e),
+            KitError::Poisoned => Self::Poisoned,
+        }
+    }
 }
 
 fn config_error(what: &str, error: &dyn std::fmt::Display) -> ModuleError {
@@ -142,27 +151,19 @@ fn reply(msg_type: &str, payload: Value) -> Message {
 
 /// Shared, thread-safe frame writer (listener and worker threads write too).
 #[derive(Clone)]
-struct Out {
-    inner: Arc<Mutex<Box<dyn Write + Send>>>,
-}
+struct Out(avscan_module_kit::Out);
 
 impl Out {
     fn new(output: Box<dyn Write + Send>) -> Self {
-        Self {
-            inner: Arc::new(Mutex::new(output)),
-        }
+        Self(avscan_module_kit::Out::new(output))
     }
 
     fn send(&self, msg: &Message) -> Result<(), ModuleError> {
-        let frame = encode_frame(msg)?;
-        let mut out = self.inner.lock().map_err(|_| ModuleError::Poisoned)?;
-        out.write_all(&frame)?;
-        out.flush()?;
-        Ok(())
+        Ok(self.0.send(msg)?)
     }
 
     fn event(&self, topic: &str, data: Value) -> Result<(), ModuleError> {
-        self.send(&reply("event", json!({ "topic": topic, "data": data })))
+        Ok(self.0.event(MODULE_ID, topic, data)?)
     }
 }
 
@@ -203,17 +204,7 @@ fn start_listener(out: &Out, config: &ModuleConfig, sink: &AlertSink) -> Option<
 }
 
 fn recv<R: Read>(input: &mut R, frames: &mut FrameReader) -> Result<Option<Message>, ModuleError> {
-    let mut buf = [0u8; 4096];
-    loop {
-        if let Some(msg) = frames.next_message()? {
-            return Ok(Some(msg));
-        }
-        let n = input.read(&mut buf)?;
-        if n == 0 {
-            return Ok(None);
-        }
-        frames.feed(&buf[..n]);
-    }
+    Ok(avscan_module_kit::recv(input, frames)?)
 }
 
 fn result_message(id: Option<&str>, ok: bool, error: Option<&str>) -> Message {
@@ -222,42 +213,6 @@ fn result_message(id: Option<&str>, ok: bool, error: Option<&str>) -> Message {
 
 fn command_result(request: &Message, ok: bool, error: Option<&str>) -> Message {
     result_message(request.id.as_deref(), ok, error)
-}
-
-/// Worker threads of the running `net.analyze` analyses. Only the protocol
-/// thread starts workers, so the counter needs no compare-and-swap.
-#[derive(Default)]
-struct Workers {
-    handles: Vec<JoinHandle<()>>,
-    active: Arc<AtomicUsize>,
-}
-
-impl Workers {
-    /// Reserves a slot; false when `MAX_WORKERS` analyses are already running.
-    fn try_acquire(&self) -> bool {
-        if self.active.load(Ordering::SeqCst) >= MAX_WORKERS {
-            return false;
-        }
-        self.active.fetch_add(1, Ordering::SeqCst);
-        true
-    }
-
-    /// Runs `job` on a new thread and frees the reserved slot afterwards.
-    fn spawn(&mut self, job: impl FnOnce() + Send + 'static) {
-        self.handles.retain(|handle| !handle.is_finished());
-        let active = Arc::clone(&self.active);
-        self.handles.push(std::thread::spawn(move || {
-            job();
-            active.fetch_sub(1, Ordering::SeqCst);
-        }));
-    }
-
-    /// Waits for every running analysis.
-    fn join_all(&mut self) {
-        for handle in self.handles.drain(..) {
-            let _ = handle.join();
-        }
-    }
 }
 
 /// Answers one `command`. Unknown commands and bad arguments are answered at
@@ -378,7 +333,7 @@ pub fn run<R: Read>(mut input: R, output: Box<dyn Write + Send>) -> Result<(), M
     }
     let listener = start_listener(&out, &config, &sink);
 
-    let mut workers = Workers::default();
+    let mut workers = Workers::new(MAX_WORKERS);
     let exit = serve(&mut input, &mut frames, &out, &config, &sink, &mut workers);
     workers.join_all();
     drop(listener);
@@ -394,6 +349,8 @@ mod tests {
     use crate::decode::TCP_SYN;
     use crate::pcap::LINKTYPE_ETHERNET;
     use crate::test_util::{pcap_file, tcp_frame, TempDir};
+    use avscan_protocol::encode_frame;
+    use std::sync::Mutex;
 
     use avscan_manifest::{parse_manifest, HOST_API_VERSION};
 
@@ -581,30 +538,6 @@ mod tests {
         assert_eq!(events_before, 2);
         assert_eq!(replies[at].id.as_deref(), Some("cmd-1"));
         assert_eq!(replies[at].payload["ok"], json!(true));
-    }
-
-    #[test]
-    fn the_number_of_running_analyses_is_bounded() {
-        let workers = Workers::default();
-        for _ in 0..MAX_WORKERS {
-            assert!(workers.try_acquire());
-        }
-        assert!(!workers.try_acquire());
-        workers.active.fetch_sub(1, Ordering::SeqCst);
-        assert!(workers.try_acquire());
-    }
-
-    #[test]
-    fn workers_free_their_slot_and_are_joined() {
-        let mut workers = Workers::default();
-        let (tx, rx) = std::sync::mpsc::channel();
-        assert!(workers.try_acquire());
-        workers.spawn(move || {
-            tx.send(7).unwrap();
-        });
-        workers.join_all();
-        assert_eq!(rx.recv().unwrap(), 7);
-        assert_eq!(workers.active.load(Ordering::SeqCst), 0);
     }
 
     #[test]
