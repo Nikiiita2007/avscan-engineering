@@ -104,6 +104,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "avscan-module-kit"
+version = "0.1.0"
+dependencies = [
+ "avscan-protocol",
+ "serde_json",
+]
+
+[[package]]
 name = "avscan-orchestrator"
 version = "0.1.0"
 dependencies = [
@@ -404,6 +412,7 @@ name = "log-hunter"
 version = "0.1.0"
 dependencies = [
  "avscan-manifest",
+ "avscan-module-kit",
  "avscan-orchestrator",
  "avscan-protocol",
  "serde",
@@ -455,6 +464,7 @@ name = "net-analyzer"
 version = "0.1.0"
 dependencies = [
  "avscan-manifest",
+ "avscan-module-kit",
  "avscan-orchestrator",
  "avscan-protocol",
  "serde",
@@ -872,6 +882,7 @@ name = "vuln-scanner"
 version = "0.1.0"
 dependencies = [
  "avscan-manifest",
+ "avscan-module-kit",
  "avscan-orchestrator",
  "avscan-protocol",
  "regex",

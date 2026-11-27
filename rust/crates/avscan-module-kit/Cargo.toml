@@ -1,0 +1,10 @@
+[package]
+name = "avscan-module-kit"
+description = "Shared helpers for AVScan module runtimes"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+avscan-protocol.workspace = true
+serde_json.workspace = true

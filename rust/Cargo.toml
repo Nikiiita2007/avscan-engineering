@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/avscan-protocol",
     "crates/avscan-manifest",
+    "crates/avscan-module-kit",
     "crates/orchestrator",
     "crates/vuln-scanner",
     "crates/net-analyzer",
@@ -25,3 +26,4 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 avscan-protocol = { path = "crates/avscan-protocol" }
 avscan-manifest = { path = "crates/avscan-manifest" }
+avscan-module-kit = { path = "crates/avscan-module-kit" }

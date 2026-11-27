@@ -1,3 +1,4 @@
+
 [package]
 name = "net-analyzer"
 description = "Passive network traffic analyzer: pcap files and a localhost pcap stream"
@@ -14,6 +15,7 @@ name = "net-analyzer"
 path = "src/main.rs"
 
 [dependencies]
+avscan-module-kit.workspace = true
 avscan-protocol.workspace = true
 serde.workspace = true
 serde_json.workspace = true
