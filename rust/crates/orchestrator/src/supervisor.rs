@@ -125,7 +125,8 @@ impl Default for RunOptions {
     }
 }
 
-/// Reads and validates the manifests listed in the configuration.
+/// Reads and validates the manifests listed in the configuration. The
+/// module `config` of an entry becomes the override sent in `start`.
 pub fn load_specs(config: &Config) -> Result<Vec<ModuleSpec>> {
     let mut specs = Vec::new();
     for entry in config.modules.iter().filter(|m| m.enabled) {
@@ -138,7 +139,7 @@ pub fn load_specs(config: &Config) -> Result<Vec<ModuleSpec>> {
             manifest,
             binary: entry.binary.clone(),
             extra_args: entry.args.clone(),
-            config_override: Map::new(),
+            config_override: entry.config.clone(),
         });
     }
     Ok(specs)
@@ -525,6 +526,24 @@ mod tests {
         assert_eq!(backoff.delay(2), Duration::from_millis(400));
         assert_eq!(backoff.delay(4), Duration::from_secs(1));
         assert_eq!(backoff.delay(1000), Duration::from_secs(1));
+    }
+
+    #[test]
+    fn module_settings_from_the_config_reach_the_spec() {
+        let dir = std::env::temp_dir().join(format!("avscan-specs-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let manifest = dir.join("module.json");
+        let text = r#"{"id":"ghost_mod","name":"Ghost","version":"0.1.0","api_version":1,"entry":{"exe":"ghost"}}"#;
+        std::fs::write(&manifest, text).unwrap();
+        let shown = serde_json::to_string(&manifest.to_string_lossy()).unwrap();
+        let config = format!(
+            r#"{{"modules":[{{"manifest":{shown},"binary":"ghost","config":{{"command_roots":["/srv"]}}}}]}}"#
+        );
+        let config = Config::from_json_str(&config).unwrap();
+        let specs = load_specs(&config).unwrap();
+        assert_eq!(specs.len(), 1);
+        assert_eq!(specs[0].config_override["command_roots"], json!(["/srv"]));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]
