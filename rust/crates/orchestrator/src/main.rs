@@ -13,6 +13,7 @@ use avscan_orchestrator::api;
 use avscan_orchestrator::cli::{Cli, Command};
 use avscan_orchestrator::client;
 use avscan_orchestrator::config::Config;
+use avscan_orchestrator::hosted::{split_hosted, HostedRunner};
 use avscan_orchestrator::supervisor::{load_specs, Orchestrator, RunOptions};
 
 /// Shorter tokens are too easy to guess; the API is reachable by every local user.
@@ -32,10 +33,12 @@ async fn main() -> Result<()> {
         .init();
     let config = Config::from_file(&cli.config)?;
     let specs = load_specs(&config)?;
+    let (hosted, specs) = split_hosted(specs, &config.pipes)?;
     let listen = match cli.command {
         Command::Serve { listen } => listen.unwrap_or(config.listen_addr()?),
         _ => {
-            info!(modules = specs.len(), "configuration validated");
+            let total = specs.len() + hosted.len();
+            info!(modules = total, hosted = hosted.len(), "configuration validated");
             return Ok(());
         }
     };
@@ -53,6 +56,7 @@ async fn main() -> Result<()> {
     let auth = cli.token.is_some();
     info!(address = %listener.local_addr()?, auth, "HTTP API listening");
     let orchestrator = Orchestrator::start(specs, RunOptions::default());
+    let hosted = HostedRunner::start(hosted, RunOptions::default());
     let shared = Arc::new(Mutex::new(orchestrator));
     let app = api::router_with_token(Arc::clone(&shared), cli.token.clone());
     let (stop_tx, stop_rx) = oneshot::channel::<()>();
@@ -79,5 +83,6 @@ async fn main() -> Result<()> {
     // No request handler holds this mutex while streaming SSE.
     let mutex = Arc::try_unwrap(shared).map_err(|_| anyhow::anyhow!("API state still shared"))?;
     mutex.into_inner().shutdown().await;
+    hosted.shutdown().await;
     outcome
 }

@@ -1,12 +1,14 @@
 //! Orchestrator configuration (JSON file). Every path and port is configurable.
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 use serde_json::{Map, Value};
 use thiserror::Error;
+
+use crate::pipe::is_valid_pipe_name;
 
 pub const DEFAULT_LISTEN: &str = "127.0.0.1:8787";
 pub const DEFAULT_LOG_DIR: &str = "logs";
@@ -55,6 +57,11 @@ pub struct Config {
     pub log_dir: PathBuf,
     #[serde(default)]
     pub modules: Vec<ModuleEntry>,
+    /// Modules driven by an external host over a named pipe (Windows only):
+    /// module id to pipe name (`\\.\pipe\<name>`). The orchestrator spawns
+    /// such a module and relays bytes; it does not run the handshake itself.
+    #[serde(default)]
+    pub pipes: BTreeMap<String, String>,
 }
 
 fn default_true() -> bool {
@@ -107,6 +114,21 @@ impl Config {
                 return Err(ConfigError::Invalid(msg));
             }
         }
+        let mut pipe_names = HashSet::new();
+        for (id, name) in &self.pipes {
+            if !is_valid_pipe_name(name) {
+                let msg = format!("bad pipe name '{name}' for module '{id}'");
+                return Err(ConfigError::Invalid(msg));
+            }
+            if !pipe_names.insert(name.to_ascii_lowercase()) {
+                let msg = format!("pipe '{name}' is used by more than one module");
+                return Err(ConfigError::Invalid(msg));
+            }
+        }
+        if !self.pipes.is_empty() && !cfg!(windows) {
+            let msg = "named pipes are supported only on Windows".to_string();
+            return Err(ConfigError::Invalid(msg));
+        }
         Ok(())
     }
 }
@@ -115,12 +137,17 @@ impl Config {
 mod tests {
     use super::*;
 
+    use serde_json::json;
+
+    use crate::pipe::default_pipe_name;
+
     #[test]
     fn defaults_are_applied() {
         let cfg = Config::from_json_str("{}").unwrap();
         assert_eq!(cfg.listen, DEFAULT_LISTEN);
         assert_eq!(cfg.log_dir, PathBuf::from(DEFAULT_LOG_DIR));
         assert!(cfg.modules.is_empty());
+        assert!(cfg.pipes.is_empty());
     }
 
     #[test]
@@ -177,5 +204,24 @@ mod tests {
     fn missing_file_is_a_read_error() {
         let err = Config::from_file(Path::new("definitely/missing.json")).unwrap_err();
         assert!(matches!(err, ConfigError::Read { .. }));
+    }
+
+    #[test]
+    fn bad_pipe_names_are_rejected() {
+        let text = json!({"pipes": {"a": "avscan"}}).to_string();
+        assert!(Config::from_json_str(&text).is_err());
+    }
+
+    #[test]
+    fn two_modules_cannot_share_a_pipe() {
+        let name = default_pipe_name("shared");
+        let text = json!({"pipes": {"a": name, "b": name}}).to_string();
+        assert!(Config::from_json_str(&text).is_err());
+    }
+
+    #[test]
+    fn pipes_are_accepted_only_on_windows() {
+        let text = json!({"pipes": {"a": default_pipe_name("a")}}).to_string();
+        assert_eq!(Config::from_json_str(&text).is_ok(), cfg!(windows));
     }
 }
