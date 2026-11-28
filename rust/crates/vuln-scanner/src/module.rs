@@ -22,12 +22,9 @@
 
 use std::io::{Read, Write};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Mutex;
-use std::thread::Scope;
 
-use avscan_module_kit::{check_paths, paths_from};
-use avscan_protocol::{encode_frame, FrameReader, Message, ProtocolError};
+use avscan_module_kit::{check_paths, paths_from, Workers};
+use avscan_protocol::{FrameReader, Message, ProtocolError};
 use serde_json::{json, Value};
 use thiserror::Error;
 
@@ -116,23 +113,16 @@ fn reply(msg_type: &str, payload: Value) -> Message {
 }
 
 /// The output stream, shared by the protocol thread and the scan threads.
-struct Out<W> {
-    inner: Mutex<W>,
-}
+#[derive(Clone)]
+struct Out(avscan_module_kit::Out);
 
-impl<W: Write> Out<W> {
-    fn new(output: W) -> Self {
-        Self {
-            inner: Mutex::new(output),
-        }
+impl Out {
+    fn new(output: Box<dyn Write + Send>) -> Self {
+        Self(avscan_module_kit::Out::new(output))
     }
 
     fn send(&self, msg: &Message) -> Result<(), ModuleError> {
-        let frame = encode_frame(msg)?;
-        let mut out = self.inner.lock().map_err(|_| ModuleError::Poisoned)?;
-        out.write_all(&frame)?;
-        out.flush()?;
-        Ok(())
+        Ok(self.0.send(msg)?)
     }
 }
 
@@ -149,11 +139,7 @@ fn report_event(report: &crate::report::Report) -> Result<Message, ModuleError> 
     ))
 }
 
-fn publish_scan<W: Write>(
-    out: &Out<W>,
-    paths: &[PathBuf],
-    options: &ScanOptions,
-) -> Result<(), ModuleError> {
+fn publish_scan(out: &Out, paths: &[PathBuf], options: &ScanOptions) -> Result<(), ModuleError> {
     let mut report = scan_paths(paths, options);
     let event = report_event(&report)?;
     match out.send(&event) {
@@ -184,22 +170,21 @@ enum Answer {
 }
 
 /// Starts a scan on a worker thread. Returns false, and starts nothing, when
-/// `MAX_WORKERS` scans already run. Only the protocol thread calls this, so the
-/// counter needs no compare-and-swap. The scope joins every worker.
-fn spawn_scan<'scope, 'env, W: Write + Send>(
-    scope: &'scope Scope<'scope, 'env>,
-    out: &'env Out<W>,
-    active: &'env AtomicUsize,
-    options: &'env ScanOptions,
+/// `MAX_WORKERS` scans already run. Only the protocol thread calls this.
+fn spawn_scan(
+    workers: &mut Workers,
+    out: &Out,
+    options: &ScanOptions,
     paths: Vec<PathBuf>,
     answer: Answer,
 ) -> bool {
-    if active.load(Ordering::SeqCst) >= MAX_WORKERS {
+    if !workers.try_acquire() {
         return false;
     }
-    active.fetch_add(1, Ordering::SeqCst);
-    scope.spawn(move || {
-        let outcome = publish_scan(out, &paths, options);
+    let out = out.clone();
+    let options = options.clone();
+    workers.spawn(move || {
+        let outcome = publish_scan(&out, &paths, &options);
         if let Answer::Command(id) = answer {
             let result = match outcome {
                 Ok(()) => result_message(id.as_deref(), true, None),
@@ -207,19 +192,17 @@ fn spawn_scan<'scope, 'env, W: Write + Send>(
             };
             let _ = out.send(&result);
         }
-        active.fetch_sub(1, Ordering::SeqCst);
     });
     true
 }
 
 /// Handles a bus event. Only `vuln_scanner.scan` is acted on; a refused
 /// request is reported as a `log` message because events have no answer.
-fn handle_event<'scope, 'env, W: Write + Send>(
-    scope: &'scope Scope<'scope, 'env>,
+fn handle_event(
     msg: &Message,
-    out: &'env Out<W>,
-    config: &'env ModuleConfig,
-    active: &'env AtomicUsize,
+    out: &Out,
+    config: &ModuleConfig,
+    workers: &mut Workers,
 ) -> Result<(), ModuleError> {
     let topic = msg.payload.get("topic").and_then(Value::as_str);
     if topic != Some(SCAN_TOPIC) {
@@ -238,7 +221,7 @@ fn handle_event<'scope, 'env, W: Write + Send>(
             return out.send(&reply("log", note));
         }
     };
-    if !spawn_scan(scope, out, active, &config.options, paths, Answer::Silent) {
+    if !spawn_scan(workers, out, &config.options, paths, Answer::Silent) {
         let note = json!({ "message": "scan request refused: too many scans are running" });
         return out.send(&reply("log", note));
     }
@@ -248,12 +231,11 @@ fn handle_event<'scope, 'env, W: Write + Send>(
 /// Answers one `command`. Unknown commands and bad arguments are answered at
 /// once with `ok: false`; a valid `vuln.scan_files` is answered by its worker
 /// thread when the scan is done. Neither ends the session.
-fn handle_command<'scope, 'env, W: Write + Send>(
-    scope: &'scope Scope<'scope, 'env>,
+fn handle_command(
     request: &Message,
-    out: &'env Out<W>,
-    config: &'env ModuleConfig,
-    active: &'env AtomicUsize,
+    out: &Out,
+    config: &ModuleConfig,
+    workers: &mut Workers,
 ) -> Result<(), ModuleError> {
     let name = request
         .payload
@@ -277,17 +259,41 @@ fn handle_command<'scope, 'env, W: Write + Send>(
         }
     };
     let answer = Answer::Command(request.id.clone());
-    if !spawn_scan(scope, out, active, &config.options, paths, answer) {
+    if !spawn_scan(workers, out, &config.options, paths, answer) {
         let text = "too many scans are running";
         return out.send(&command_result(request, false, Some(text)));
     }
     Ok(())
 }
 
+/// Serves requests until `stop` (true) or until the host closes the input (false).
+fn serve<R: Read>(
+    input: &mut R,
+    frames: &mut FrameReader,
+    out: &Out,
+    config: &ModuleConfig,
+    workers: &mut Workers,
+) -> Result<bool, ModuleError> {
+    while let Some(msg) = recv(input, frames)? {
+        match msg.msg_type.as_str() {
+            "ping" => {
+                let mut pong = reply("pong", json!({}));
+                pong.id = msg.id.clone();
+                out.send(&pong)?;
+            }
+            "stop" => return Ok(true),
+            "event" => handle_event(&msg, out, config, workers)?,
+            "command" => handle_command(&msg, out, config, workers)?,
+            _ => {}
+        }
+    }
+    Ok(false)
+}
+
 /// Runs one module session until `stop` or until the host closes the input.
 /// `stop` and the end of the input both wait for the scans that still run.
-pub fn run<R: Read, W: Write + Send>(mut input: R, output: W) -> Result<(), ModuleError> {
-    let out = Out::new(output);
+pub fn run<R: Read, W: Write + Send + 'static>(mut input: R, output: W) -> Result<(), ModuleError> {
+    let out = Out::new(Box::new(output));
     let mut frames = FrameReader::new();
 
     let Some(hello) = recv(&mut input, &mut frames)? else {
@@ -319,24 +325,10 @@ pub fn run<R: Read, W: Write + Send>(mut input: R, output: W) -> Result<(), Modu
         publish_scan(&out, &config.paths, &config.options)?;
     }
 
-    let active = AtomicUsize::new(0);
-    let stopped = std::thread::scope(|scope| -> Result<bool, ModuleError> {
-        while let Some(msg) = recv(&mut input, &mut frames)? {
-            match msg.msg_type.as_str() {
-                "ping" => {
-                    let mut pong = reply("pong", json!({}));
-                    pong.id = msg.id.clone();
-                    out.send(&pong)?;
-                }
-                "stop" => return Ok(true),
-                "event" => handle_event(scope, &msg, &out, &config, &active)?,
-                "command" => handle_command(scope, &msg, &out, &config, &active)?,
-                _ => {}
-            }
-        }
-        Ok(false)
-    })?;
-    if stopped {
+    let mut workers = Workers::new(MAX_WORKERS);
+    let stopped = serve(&mut input, &mut frames, &out, &config, &mut workers);
+    workers.join_all();
+    if stopped? {
         out.send(&reply("stopped", json!({})))?;
     }
     Ok(())
@@ -348,6 +340,23 @@ mod tests {
     use crate::test_util::TempDir;
 
     use avscan_manifest::{parse_manifest, HOST_API_VERSION};
+    use avscan_protocol::encode_frame;
+    use std::io;
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Clone, Default)]
+    struct SharedBuf(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for SharedBuf {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
 
     fn host_msg(msg_type: &str, payload: Value) -> Message {
         reply(msg_type, payload)
@@ -378,9 +387,10 @@ mod tests {
 
     fn run_session(messages: Vec<Message>) -> Result<Vec<Message>, ModuleError> {
         let input = frames(messages);
-        let mut output = Vec::new();
-        run(input.as_slice(), &mut output)?;
-        Ok(decode_all(&output))
+        let buf = SharedBuf::default();
+        run(input.as_slice(), buf.clone())?;
+        let bytes = buf.0.lock().unwrap().clone();
+        Ok(decode_all(&bytes))
     }
 
     fn handshake(start_config: Value) -> Vec<Message> {
@@ -533,31 +543,31 @@ mod tests {
 
     #[test]
     fn scans_are_refused_when_all_slots_are_busy() {
-        let out = Out::new(Vec::<u8>::new());
-        let active = AtomicUsize::new(MAX_WORKERS);
+        let out = Out::new(Box::new(SharedBuf::default()));
+        let mut workers = Workers::new(MAX_WORKERS);
+        for _ in 0..MAX_WORKERS {
+            assert!(workers.try_acquire());
+        }
         let options = ScanOptions::default();
-        std::thread::scope(|scope| {
-            let started = spawn_scan(scope, &out, &active, &options, Vec::new(), Answer::Silent);
-            assert!(!started);
-        });
-        assert_eq!(active.load(Ordering::SeqCst), MAX_WORKERS);
+        let started = spawn_scan(&mut workers, &out, &options, Vec::new(), Answer::Silent);
+        assert!(!started);
+        assert_eq!(workers.active(), MAX_WORKERS);
     }
 
     #[test]
     fn a_finished_scan_frees_its_slot_and_answers() {
         let dir = TempDir::new("module_slot");
         dir.write("Dockerfile", "FROM ubuntu:16.04\n");
-        let out = Out::new(Vec::<u8>::new());
-        let active = AtomicUsize::new(0);
+        let buf = SharedBuf::default();
+        let out = Out::new(Box::new(buf.clone()));
+        let mut workers = Workers::new(MAX_WORKERS);
         let options = ScanOptions::default();
-        std::thread::scope(|scope| {
-            let paths = vec![dir.path().to_path_buf()];
-            let answer = Answer::Command(Some("cmd-1".to_string()));
-            let started = spawn_scan(scope, &out, &active, &options, paths, answer);
-            assert!(started);
-        });
-        assert_eq!(active.load(Ordering::SeqCst), 0);
-        let bytes = out.inner.lock().unwrap().clone();
+        let paths = vec![dir.path().to_path_buf()];
+        let answer = Answer::Command(Some("cmd-1".to_string()));
+        assert!(spawn_scan(&mut workers, &out, &options, paths, answer));
+        workers.join_all();
+        assert_eq!(workers.active(), 0);
+        let bytes = buf.0.lock().unwrap().clone();
         let messages = decode_all(&bytes);
         assert_eq!(types(&messages), ["event", "command_result"]);
         assert_eq!(messages[1].id.as_deref(), Some("cmd-1"));
