@@ -161,4 +161,8 @@ if(AV_HOST)
  add_executable(host_pipe_tests tests/host_pipe_test.cpp)
  target_link_libraries(host_pipe_tests PRIVATE avhost)
  add_test(NAME host_pipe COMMAND host_pipe_tests)
+ # Command-line host for modules behind named pipes (see docs/PIPES.md).
+ add_executable(avhost_cli apps/host_main.cpp)
+ target_link_libraries(avhost_cli PRIVATE avhost)
+ set_target_properties(avhost_cli PROPERTIES OUTPUT_NAME avhost)
 endif()
