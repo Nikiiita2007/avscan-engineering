@@ -7,7 +7,7 @@
 - [x] Этап 4 — net_analyzer (крейт net-analyzer, существующий манифест modules/net_analyzer/module.json)
 - [x] Этап 5 — log_hunter (крейт log-hunter, манифест rust/modules/log_hunter/module.json)
 - [x] Этап 6 — CLI, HTTP, SSE, команды и события модулям, интеграционные тесты (закрыт для Rust-части, PR слит в master; перенесённые пункты в docs/rust/STAGE6.md)
-- [ ] Этап 7 — документация, примеры, финальный PR. Готово: rust/README.md, rust/examples/orchestrator.json, поле config у модуля в orchestrator.json, общий крейт avscan-module-kit (разбор путей, проверка command_roots, command_result, чтение и запись кадров, ограничение рабочих потоков). Осталось (перенесено с этапа 6): транспорт C++ антивируса (именованные каналы Windows), комментарий в avscan-protocol/src/lib.rs, анализ файлов стартового конфига в рабочих потоках, нагрузочные тесты для vuln_scanner и net_analyzer
+- [ ] Этап 7 — документация, примеры, финальный PR. Готово: rust/README.md, rust/examples/orchestrator.json, поле config у модуля в orchestrator.json, общий крейт avscan-module-kit (разбор путей, проверка command_roots, command_result, чтение и запись кадров, ограничение рабочих потоков), комментарий со списком типов сообщений в avscan-protocol/src/lib.rs. Осталось (перенесено с этапа 6): транспорт C++ антивируса (именованные каналы Windows), анализ файлов стартового конфига в рабочих потоках, нагрузочные тесты для vuln_scanner и net_analyzer
 - [ ] Этап 8 — альтернативный C++20 HTTP-сервер по учебному PDF (запланирован отдельно)
 - [ ] Этап 9 — UX/UI дизайн: локальная веб-панель поверх HTTP-API (дизайн, прототип и диаграммы готовы: docs/rust/STAGE9_UX_UI.md, docs/rust/ui/prototype.html, docs/rust/VISUALIZATION.md; сама панель не реализована)
 
