@@ -37,7 +37,7 @@ fn invalid(msg: impl Into<String>) -> ProtocolError {
 /// One protocol message (the JSON envelope inside a frame).
 ///
 /// Types used by the host: hello, hello_ack, start, started, stop, stopped,
-/// ping, pong, event, log, error.
+/// ping, pong, event, log, error, command, command_result.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Message {
     pub msg_type: String,
